@@ -8,12 +8,11 @@ import csv
 from datetime import datetime
 
 import flet as ft
-import flet_audio as fta  # Certifique-se de instalar: pip install flet-audio
-import flet_rive as fr    # Certifique-se de instalar: pip install flet-rive
+import flet_audio as fta  
+import flet_rive as fr    
 
 # -------------------- Constantes de Áudio --------------------
-JAZZ_URL = "https://luan.xyz/files/audio/ambient_c_motion.mp3"  # Som de fundo
-# Sons ajustados para serem mais coerentes com a ação:
+JAZZ_URL = "https://luan.xyz/files/audio/ambient_c_motion.mp3" 
 CRESCENDO_URL = "https://actions.google.com/sounds/v1/cartoon/slide_whistle_to_drum_hit.ogg"
 CLIQUE_URL = "https://actions.google.com/sounds/v1/ui/click.ogg"
 NEGATIVO_URL = "https://actions.google.com/sounds/v1/ui/error.ogg"
@@ -21,7 +20,7 @@ AFIRMATIVO_URL = "https://actions.google.com/sounds/v1/ui/confirmation.ogg"
 
 # -------------------- Variáveis Globais --------------------
 cancelado = False
-current_hotkey = "p"  # Hotkey padrão
+current_hotkey = "p" 
 
 # -------------------- Funções Auxiliares --------------------
 def get_saudacao() -> str:
@@ -58,7 +57,6 @@ def numerocomddd(numero: str) -> str:
     numero = numero.replace("(", "").replace(")", "").replace("-", "").replace(" ", "")
     return f"+55{numero}"
 
-# Função para reiniciar e tocar áudio (para efeitos sonoros)
 def play_sound(audio_component: fta.Audio):
     audio_component.seek(0)
     audio_component.play()
@@ -174,11 +172,10 @@ def main(page:ft.Page):
     page.frameless=True
 
     # -------------------- Splash Screen com Animação Rive --------------------
-    # Usando o componente fr.Rive com placeholder, conforme a implementação correta.
     splash = ft.Column(
         controls=[
             fr.Rive(
-                src="Animation - 1742794320756.json",  # Certifique-se de que o arquivo esteja no formato .riv e na pasta assets
+                src="Animation - 1742794320756.json",  
                 placeholder=ft.ProgressBar(),
                 width=1500,
                 height=1000
