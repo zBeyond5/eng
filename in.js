@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         Sang Hub — Módulo Surpresa
+// @name         tts
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Efeito visual + musical especial, disparado quando o LiveBlock é ativado pelo Hub
+// @version      1.1.0
+// @description  Uma surpresa automática para momentos especiais
 // @author       Sang
-// ==UserScript==
+// ==/UserScript==
 
 (function() {
     'use strict';
@@ -12,14 +12,19 @@
     const LOG = (...a) => console.log('💌 [Surpresa]', ...a);
     const ERR = (...a) => console.error('💌 [Surpresa]', ...a);
 
-    // ─────────────────────────────────────────────────────────
-    // CONFIGURAÇÃO — edite livremente aqui
-    // ─────────────────────────────────────────────────────────
+    // ─── CONFIGURAÇÃO ───
     const CONFIG = {
-        // Nome exato do card do Hub que deve disparar a surpresa
-        TRIGGER_MODULE_NAME: "LiveBlock",
+        MESSAGE_LINES: [
+            "Oi, meu amor 💕",
+            "só passando pra lembrar você...",
+            "de que eu te amo mais do que qualquer palavra explica.",
+        ],
 
-        // Imagem (link direto — o módulo tenta várias extensões automaticamente)
+        // Música (YouTube) — ID do vídeo e segundo inicial
+        YOUTUBE_ID: "eihpkV7KSKo",
+        START_SECONDS: 55,
+
+        // Imagem — várias extensões para fallback
         IMAGE_CANDIDATES: [
             "https://i.imgur.com/w3gMK1Q.jpg",
             "https://i.imgur.com/w3gMK1Q.jpeg",
@@ -27,43 +32,35 @@
             "https://i.imgur.com/w3gMK1Q.webp",
         ],
 
-        // Música (YouTube) — ID do vídeo e segundo inicial
-        YOUTUBE_ID: "eihpkV7KSKo",
-        START_SECONDS: 55,
+        // Tempo de espera após o Hub ficar pronto (em ms)
+        DELAY_BEFORE_SHOW: 3000,
 
-        // Mensagem animada (uma linha de cada vez, efeito de digitação)
-        MESSAGE_LINES: [
-            "Oi, meu amor 💕",
-            "só passando pra lembrar você...",
-            "de que eu te amo mais do que qualquer palavra explica.",
-        ],
+        // Mostrar apenas uma vez por sessão? (se false, mostra em todo carregamento)
+        ONCE_PER_SESSION: true,
 
-        // Mostra a surpresa de novo a cada vez que ela ativar o LiveBlock,
-        // ou só uma vez por sessão de navegação?
-        REPEAT_PER_ACTIVATION: true,
+        // Se true, espera o primeiro clique do usuário na página para mostrar
+        // (útil se o navegador bloquear áudio em autoplay)
+        WAIT_FOR_CLICK_TO_PLAY: false,
     };
-    // ─────────────────────────────────────────────────────────
 
+    // ─── CONTROLE DE ESTADO ───
     if (window._loveSurprise) { try { window._loveSurprise.kill(); } catch(e) {} }
     delete window._loveSurprise;
 
-    let armed = true;      // esperando o clique-gatilho
-    let shownOnce = false; // já mostrou nesta sessão
     let overlayEl = null;
     let ytPlayer = null;
-    let clickListener = null;
+    let shownThisSession = false;
+    let intervalHearts = null;
 
-    // ─── Carrega a YouTube IFrame API (uma vez só, mesmo se outro script já usa)
+    // ─── YOUTUBE API ───
     function loadYouTubeAPI() {
         return new Promise((resolve) => {
             if (window.YT && window.YT.Player) return resolve(window.YT);
-
             const prevCallback = window.onYouTubeIframeAPIReady;
             window.onYouTubeIframeAPIReady = () => {
                 if (typeof prevCallback === 'function') try { prevCallback(); } catch(e) {}
                 resolve(window.YT);
             };
-
             if (!document.querySelector('script[data-love-yt]')) {
                 const tag = document.createElement('script');
                 tag.src = "https://www.youtube.com/iframe_api";
@@ -73,7 +70,7 @@
         });
     }
 
-    // ─── Imagem com fallback de extensão
+    // ─── IMAGEM COM FALLBACK ───
     function setImageWithFallback(imgEl, candidates, idx = 0) {
         if (idx >= candidates.length) {
             imgEl.style.display = 'none';
@@ -85,7 +82,7 @@
         imgEl.src = candidates[idx];
     }
 
-    // ─── Estilos
+    // ─── INJETAR ESTILOS ───
     function injectStyles() {
         if (document.querySelector('style[data-love]')) return;
         const style = document.createElement('style');
@@ -134,7 +131,7 @@
         document.head.appendChild(style);
     }
 
-    // ─── Explosão de corações
+    // ─── CORAÇÕES ───
     function burstHearts(count = 56) {
         let box = document.getElementById('_loveHearts');
         if (!box) {
@@ -159,7 +156,7 @@
         }
     }
 
-    // ─── Mensagem com efeito de digitação, linha por linha
+    // ─── MENSAGEM COM EFEITO DE DIGITAÇÃO ───
     function typeLines(el, lines, { charDelay = 32, lineDelay = 900 } = {}) {
         el.innerHTML = '<span class="love-caret">&nbsp;</span>';
         const caret = el.querySelector('.love-caret');
@@ -188,7 +185,7 @@
         typeLine();
     }
 
-    // ─── Player de música (só áudio — iframe fica escondido)
+    // ─── INICIAR MÚSICA ───
     async function startMusic() {
         try {
             const YT = await loadYouTubeAPI();
@@ -221,9 +218,9 @@
         }
     }
 
-    // ─── Monta e mostra a surpresa
+    // ─── MOSTRAR SURPRESA ───
     async function showSurprise() {
-        if (overlayEl) return; // já está aberta
+        if (overlayEl) return;
         injectStyles();
 
         const overlay = document.createElement('div');
@@ -246,15 +243,13 @@
         overlay.querySelector('.love-frame').style.animationName = 'loveCardIn, loveGlow, loveBeat';
 
         burstHearts(56);
-        const heartLoop = setInterval(() => { if (overlayEl) burstHearts(18); }, 1600);
+        intervalHearts = setInterval(() => { if (overlayEl) burstHearts(18); }, 1600);
 
         typeLines(overlay.querySelector('.love-msg'), CONFIG.MESSAGE_LINES);
 
         const soundBtn = overlay.querySelector('.love-sound');
         const played = await startMusic();
         if (!played || (ytPlayer && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1)) {
-            // Autoplay pode ser bloqueado pelo navegador — libera um botão que
-            // conta como um clique novo (gesto garantido, toca sem falhar).
             soundBtn.style.display = 'inline-block';
             soundBtn.addEventListener('click', () => {
                 try { ytPlayer.unMute(); ytPlayer.playVideo(); } catch(e) {}
@@ -263,12 +258,13 @@
         }
 
         function close() {
-            clearInterval(heartLoop);
+            clearInterval(intervalHearts);
             try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
             overlay.remove();
             const hearts = document.getElementById('_loveHearts');
             if (hearts) hearts.remove();
             overlayEl = null;
+            intervalHearts = null;
         }
 
         overlay.querySelector('.love-close').addEventListener('click', close);
@@ -280,35 +276,78 @@
         window._loveSurprise._close = close;
     }
 
-    // ─── Escuta o clique no card do LiveBlock dentro do Hub (gesto real do usuário,
-    // necessário pro navegador permitir tocar áudio automaticamente)
-    function armTrigger() {
-        clickListener = (e) => {
-            if (!armed) return;
-            const item = e.target.closest('.hub-item');
-            if (!item) return;
-            const name = item.querySelector('.hub-name')?.textContent?.trim();
-            if (name !== CONFIG.TRIGGER_MODULE_NAME) return;
-            if (shownOnce && !CONFIG.REPEAT_PER_ACTIVATION) return;
-
-            shownOnce = true;
-            showSurprise();
-        };
-        document.addEventListener('click', clickListener, true);
-        LOG(`Armado — esperando clique em "${CONFIG.TRIGGER_MODULE_NAME}" no painel do Hub`);
+    // ─── DISPARAR AUTOMATICAMENTE ───
+    function triggerSurprise() {
+        if (shownThisSession && CONFIG.ONCE_PER_SESSION) {
+            LOG('Surpresa já foi mostrada nesta sessão.');
+            return;
+        }
+        shownThisSession = true;
+        // Se WAIT_FOR_CLICK_TO_PLAY estiver ativo, aguarda o primeiro clique do usuário
+        if (CONFIG.WAIT_FOR_CLICK_TO_PLAY) {
+            LOG('Aguardando primeiro clique do usuário para mostrar a surpresa...');
+            const handler = () => {
+                document.removeEventListener('click', handler, true);
+                showSurprise();
+            };
+            document.addEventListener('click', handler, true);
+            // Fallback: se não houver clique em 15 segundos, mostra mesmo assim
+            setTimeout(() => {
+                document.removeEventListener('click', handler, true);
+                if (!overlayEl) showSurprise();
+            }, 15000);
+        } else {
+            // Mostra após o atraso configurado
+            setTimeout(() => {
+                showSurprise();
+            }, CONFIG.DELAY_BEFORE_SHOW);
+        }
     }
 
+    // ─── ESPERAR O HUB FICAR PRONTO ───
+    function waitForHub() {
+        return new Promise((resolve) => {
+            // O Hub cria a variável _hubUI quando termina de construir a UI
+            const check = () => {
+                if (window._hubUI && typeof window._hubUI.kill === 'function') {
+                    LOG('Hub detectado!');
+                    resolve();
+                } else {
+                    setTimeout(check, 300);
+                }
+            };
+            check();
+        });
+    }
+
+    // ─── INICIALIZAÇÃO ───
+    async function init() {
+        LOG('Módulo surpresa carregado.');
+        // Aguarda o Hub estar pronto
+        await waitForHub();
+        LOG('Hub pronto, agendando surpresa...');
+        triggerSurprise();
+    }
+
+    // ─── KILL ───
     function kill() {
-        armed = false;
-        if (clickListener) document.removeEventListener('click', clickListener, true);
+        if (intervalHearts) clearInterval(intervalHearts);
         if (overlayEl && window._loveSurprise?._close) window._loveSurprise._close();
         const hearts = document.getElementById('_loveHearts');
         if (hearts) hearts.remove();
         const style = document.querySelector('style[data-love]');
         if (style) style.remove();
+        try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
+        LOG('Módulo surpresa encerrado.');
     }
 
     window._loveSurprise = { kill };
-    armTrigger();
+
+    // ─── INICIA ───
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        init();
+    } else {
+        document.addEventListener('DOMContentLoaded', init);
+    }
 
 })();
