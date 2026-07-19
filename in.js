@@ -20,10 +20,6 @@
         ],
         DELAY_BEFORE_SHOW: 3000,
         ONCE_PER_SESSION: true,
-        // Se true, a música começa mutada e depois desmuta sozinha (tenta autoplay)
-        AUTO_UNMUTE: true,
-        // Tempo em ms para desmutar após o player ficar pronto
-        UNMUTE_DELAY: 1500,
     };
 
     if (window._loveSurprise) { try { window._loveSurprise.kill(); } catch(e) {} }
@@ -33,8 +29,83 @@
     let ytPlayer = null;
     let shownThisSession = false;
     let intervalHearts = null;
-    let unmuteTimer = null;
+    let soundActivated = false;
+    let radioStopped = false;
 
+    // ─── FUNÇÃO PARA PARAR A RÁDIO DO JOGO ───
+    function stopRadio() {
+        if (radioStopped) return;
+        LOG('🔇 Tentando parar a rádio do jogo...');
+
+        try {
+            // 1. Para todos os elementos <audio> e <video>
+            document.querySelectorAll('audio, video').forEach(el => {
+                try {
+                    el.pause();
+                    el.currentTime = 0;
+                    el.muted = true;
+                    el.volume = 0;
+                    el.removeAttribute('autoplay');
+                    LOG(`🔇 Áudio/Video pausado: ${el.id || el.className || 'sem ID'}`);
+                } catch(e) {}
+            });
+
+            // 2. Tenta encontrar players Flash/Embed (Habbo antigo)
+            document.querySelectorAll('object, embed, iframe[src*="radio"], iframe[src*="stream"]').forEach(el => {
+                try {
+                    // Tenta remover ou desativar
+                    if (el.tagName === 'IFRAME') {
+                        el.src = 'about:blank';
+                    } else {
+                        el.style.display = 'none';
+                    }
+                    LOG(`🔇 Elemento de rádio desativado: ${el.tagName}`);
+                } catch(e) {}
+            });
+
+            // 3. Intercepta criação futura de áudio (para evitar que a rádio reinicie)
+            const origAudio = window.Audio;
+            window.Audio = function(...args) {
+                const audio = new origAudio(...args);
+                // Se o áudio for criado depois, pausa imediatamente
+                setTimeout(() => {
+                    try {
+                        audio.pause();
+                        audio.muted = true;
+                        audio.volume = 0;
+                    } catch(e) {}
+                }, 0);
+                return audio;
+            };
+            window.Audio.prototype = origAudio.prototype;
+
+            // 4. Tenta encontrar a rádio via elementos de classe "radio" ou "player" no Habbo
+            document.querySelectorAll('[class*="radio"], [class*="player"], [id*="radio"], [id*="player"]').forEach(el => {
+                try {
+                    // Se for um container, tenta remover ou esconder
+                    if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
+                        el.style.display = 'none';
+                    } else {
+                        el.pause?.();
+                        el.muted = true;
+                    }
+                    LOG(`🔇 Elemento de rádio por classe/ID desativado: ${el.id || el.className}`);
+                } catch(e) {}
+            });
+
+            // 5. Para o stream de áudio via WebSocket (se houver)
+            //   - Isso é mais complexo, mas podemos tentar interceptar WebSockets que estejam enviando dados de áudio
+            //   - Vamos deixar como fallback: se a rádio ainda estiver tocando, o usuário pode clicar no botão de som da surpresa
+            //   - E a surpresa já vai desmutar o áudio principal
+
+            radioStopped = true;
+            LOG('✅ Rádio do jogo parada/desativada.');
+        } catch(e) {
+            ERR('❌ Erro ao tentar parar a rádio:', e);
+        }
+    }
+
+    // ─── YOUTUBE API ───
     function loadYouTubeAPI() {
         return new Promise((resolve) => {
             if (window.YT && window.YT.Player) return resolve(window.YT);
@@ -80,14 +151,15 @@
 
         #_loveOverlay{position:fixed;inset:0;background:radial-gradient(circle at center,rgba(40,8,24,.92),rgba(10,2,8,.96));
         z-index:2147483646;display:flex;align-items:center;justify-content:center;
-        animation:loveFadeIn .4s ease-out;font-family:'Poppins',system-ui,sans-serif;}
+        animation:loveFadeIn .4s ease-out;font-family:'Poppins',system-ui,sans-serif;cursor:pointer;}
 
         #_loveOverlay .love-close{position:absolute;top:22px;right:26px;width:34px;height:34px;border-radius:50%;
         background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#ffd9e6;
-        display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;transition:background .15s}
+        display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;transition:background .15s;z-index:10}
         #_loveOverlay .love-close:hover{background:rgba(255,255,255,.18)}
 
-        #_loveOverlay .love-card{display:flex;flex-direction:column;align-items:center;gap:18px;padding:20px;max-width:min(90vw,420px)}
+        #_loveOverlay .love-card{display:flex;flex-direction:column;align-items:center;gap:18px;padding:20px;max-width:min(90vw,420px);pointer-events:none}
+        #_loveOverlay .love-card *{pointer-events:auto}
 
         #_loveOverlay .love-frame{position:relative;width:200px;height:200px;border-radius:50%;overflow:hidden;
         border:4px solid #ff6f9c;animation:loveCardIn .5s ease-out, loveGlow 2.4s ease-in-out infinite;background:#2a0f18;
@@ -99,15 +171,20 @@
         line-height:1.5;text-shadow:0 2px 12px rgba(255,90,140,.5);animation:loveCardIn .5s ease-out .1s both}
         #_loveOverlay .love-msg .love-caret{display:inline-block;width:2px;background:#ffb6cf;margin-left:2px;animation:loveBlink 1s step-start infinite}
 
-        #_loveOverlay .love-sound{margin-top:4px;padding:8px 16px;border-radius:999px;background:rgba(255,111,156,.16);
-        border:1px solid rgba(255,111,156,.5);color:#ffd9e6;font-size:12px;font-weight:700;cursor:pointer;display:none}
-        #_loveOverlay .love-sound:hover{background:rgba(255,111,156,.28)}
-        #_loveOverlay .love-sound.visible{display:inline-block}
+        #_loveOverlay .love-hint{position:absolute;bottom:40px;left:0;right:0;text-align:center;color:rgba(255,255,255,.35);
+        font-size:12px;font-weight:300;letter-spacing:1px;animation:loveFadeIn 2s ease-out 1.5s both}
+        #_loveOverlay .love-hint span{display:inline-block;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.04);backdrop-filter:blur(4px);border:1px solid rgba(255,255,255,.04)}
 
         #_loveHearts{position:fixed;inset:0;pointer-events:none;z-index:2147483647;overflow:hidden}
         #_loveHearts span{position:absolute;bottom:-40px;animation:loveFloatUp linear forwards;will-change:transform,opacity}
 
         #_loveYt{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;bottom:0;right:0}
+
+        #_loveOverlay .love-sound-btn{display:none;margin-top:4px;padding:8px 16px;border-radius:999px;
+        background:rgba(255,111,156,.16);border:1px solid rgba(255,111,156,.5);color:#ffd9e6;font-size:12px;font-weight:700;
+        cursor:pointer;transition:background .15s;pointer-events:auto}
+        #_loveOverlay .love-sound-btn:hover{background:rgba(255,111,156,.28)}
+        #_loveOverlay .love-sound-btn.visible{display:inline-block}
         `;
         document.head.appendChild(style);
     }
@@ -164,7 +241,6 @@
         typeLine();
     }
 
-    // ─── INICIAR MÚSICA COM AUTOPLAY (INICIA MUTADO E DEPOIS DESMUTA) ───
     async function startMusic() {
         try {
             const YT = await loadYouTubeAPI();
@@ -175,9 +251,6 @@
                 document.body.appendChild(holder);
             }
 
-            // Se AUTO_UNMUTE estiver ativo, começa mutado e desmuta depois
-            const muteParam = CONFIG.AUTO_UNMUTE ? 1 : 0;
-
             return new Promise((resolve) => {
                 ytPlayer = new YT.Player(holder, {
                     videoId: CONFIG.YOUTUBE_ID,
@@ -187,42 +260,15 @@
                         controls: 0,
                         disablekb: 1,
                         modestbranding: 1,
-                        mute: muteParam
+                        mute: 1,
                     },
                     events: {
                         onReady: (e) => {
-                            LOG('Player do YouTube pronto');
-                            try {
-                                if (CONFIG.AUTO_UNMUTE) {
-                                    // Aguarda um tempo para desmutar
-                                    unmuteTimer = setTimeout(() => {
-                                        try {
-                                            e.target.unMute();
-                                            e.target.setVolume(70);
-                                            LOG('Áudio desmutado automaticamente');
-                                            // Esconde o botão de som se estiver visível
-                                            const soundBtn = document.querySelector('.love-sound');
-                                            if (soundBtn) soundBtn.classList.remove('visible');
-                                        } catch(err) {
-                                            ERR('Falha ao desmutar:', err);
-                                            // Mostra o botão de som se falhar
-                                            const soundBtn = document.querySelector('.love-sound');
-                                            if (soundBtn) soundBtn.classList.add('visible');
-                                        }
-                                    }, CONFIG.UNMUTE_DELAY);
-                                } else {
-                                    // Se não for desmutar automaticamente, mostra o botão
-                                    const soundBtn = document.querySelector('.love-sound');
-                                    if (soundBtn) soundBtn.classList.add('visible');
-                                }
-                            } catch(e) {}
+                            LOG('Player pronto, música mutada. Aguardando clique para ativar som.');
                             resolve(true);
                         },
                         onError: (e) => {
-                            ERR('Falha no player do YouTube:', e);
-                            // Mostra o botão de som em caso de erro
-                            const soundBtn = document.querySelector('.love-sound');
-                            if (soundBtn) soundBtn.classList.add('visible');
+                            ERR('Erro no player:', e);
                             resolve(false);
                         }
                     }
@@ -234,10 +280,30 @@
         }
     }
 
-    // ─── MOSTRAR SURPRESA ───
+    function activateSound() {
+        if (soundActivated) return;
+        if (!ytPlayer) return;
+        try {
+            ytPlayer.unMute();
+            ytPlayer.setVolume(70);
+            ytPlayer.playVideo();
+            soundActivated = true;
+            LOG('🔊 Som ativado!');
+            const hint = document.querySelector('.love-hint');
+            if (hint) hint.style.opacity = '0';
+            const btn = document.querySelector('.love-sound-btn');
+            if (btn) btn.classList.remove('visible');
+        } catch(e) {
+            ERR('Falha ao ativar som:', e);
+        }
+    }
+
     async function showSurprise() {
         if (overlayEl) return;
         injectStyles();
+
+        // ─── PARA A RÁDIO ANTES DE MOSTRAR A SURPRESA ───
+        stopRadio();
 
         const overlay = document.createElement('div');
         overlay.id = '_loveOverlay';
@@ -249,8 +315,9 @@
                     <div class="love-img-fallback">💖</div>
                 </div>
                 <div class="love-msg"></div>
-                <div class="love-sound">🔊 Tocar música</div>
+                <div class="love-sound-btn">🔊 Clique para ouvir</div>
             </div>
+            <div class="love-hint"><span>💫 toque em qualquer lugar para ativar o som</span></div>
         `;
         document.body.appendChild(overlay);
         overlayEl = overlay;
@@ -263,34 +330,21 @@
 
         typeLines(overlay.querySelector('.love-msg'), CONFIG.MESSAGE_LINES);
 
-        // Inicia a música (com autoplay tentado)
-        const soundBtn = overlay.querySelector('.love-sound');
-        const played = await startMusic();
+        await startMusic();
 
-        // Se a música não tocou ou o autoplay falhou, mostra o botão
-        if (!played || !CONFIG.AUTO_UNMUTE) {
-            soundBtn.classList.add('visible');
-        }
-
-        // Botão de som: tenta tocar a música manualmente
-        soundBtn.addEventListener('click', () => {
-            try {
-                if (ytPlayer) {
-                    ytPlayer.unMute();
-                    ytPlayer.playVideo();
-                    ytPlayer.setVolume(70);
-                    LOG('Música iniciada manualmente');
-                    soundBtn.classList.remove('visible');
-                }
-            } catch(e) {
-                ERR('Erro ao tocar manualmente:', e);
-            }
+        overlay.addEventListener('click', (e) => {
+            if (e.target.closest('.love-close')) return;
+            activateSound();
         });
 
-        // Fechamento
+        const soundBtn = overlay.querySelector('.love-sound-btn');
+        soundBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            activateSound();
+        });
+
         function close() {
             clearInterval(intervalHearts);
-            clearTimeout(unmuteTimer);
             try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
             overlay.remove();
             const hearts = document.getElementById('_loveHearts');
@@ -299,16 +353,25 @@
             intervalHearts = null;
         }
 
-        overlay.querySelector('.love-close').addEventListener('click', close);
-        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+        overlay.querySelector('.love-close').addEventListener('click', (e) => {
+            e.stopPropagation();
+            close();
+        });
+
         document.addEventListener('keydown', function escClose(e) {
             if (e.key === 'Escape') { close(); document.removeEventListener('keydown', escClose); }
         });
 
         window._loveSurprise._close = close;
+
+        setTimeout(() => {
+            if (!soundActivated && overlayEl) {
+                soundBtn.classList.add('visible');
+                LOG('⏳ Nenhum clique detectado, exibindo botão de som.');
+            }
+        }, 5000);
     }
 
-    // ─── DISPARAR ───
     function triggerSurprise() {
         if (shownThisSession && CONFIG.ONCE_PER_SESSION) {
             LOG('Surpresa já mostrada nesta sessão.');
@@ -320,7 +383,6 @@
         }, CONFIG.DELAY_BEFORE_SHOW);
     }
 
-    // ─── ESPERAR O HUB ───
     function waitForHub() {
         return new Promise((resolve) => {
             const check = () => {
@@ -335,7 +397,6 @@
         });
     }
 
-    // ─── INICIALIZAÇÃO ───
     async function init() {
         LOG('Módulo surpresa carregado.');
         await waitForHub();
@@ -343,10 +404,8 @@
         triggerSurprise();
     }
 
-    // ─── KILL ───
     function kill() {
         clearInterval(intervalHearts);
-        clearTimeout(unmuteTimer);
         if (overlayEl && window._loveSurprise?._close) window._loveSurprise._close();
         const hearts = document.getElementById('_loveHearts');
         if (hearts) hearts.remove();
