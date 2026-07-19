@@ -1,11 +1,3 @@
-// ==UserScript==
-// @name         Surpresa Especial (Auto Play)
-// @namespace    http://tampermonkey.net/
-// @version      1.2.0
-// @description  Surpresa automática com música (tenta autoplay)
-// @author       Sang
-// ==/UserScript==
-
 (function() {
     'use strict';
 
