@@ -20,6 +20,10 @@
         ],
         DELAY_BEFORE_SHOW: 3000,
         ONCE_PER_SESSION: true,
+        // Tenta parar a rádio do jogo automaticamente
+        STOP_RADIO: true,
+        // Aguarda o primeiro clique em qualquer lugar da página para desmutar
+        WAIT_FOR_GLOBAL_CLICK: true,
     };
 
     if (window._loveSurprise) { try { window._loveSurprise.kill(); } catch(e) {} }
@@ -30,82 +34,90 @@
     let shownThisSession = false;
     let intervalHearts = null;
     let soundActivated = false;
-    let radioStopped = false;
+    let clickHandler = null;
 
-    // ─── FUNÇÃO PARA PARAR A RÁDIO DO JOGO ───
-    function stopRadio() {
-        if (radioStopped) return;
-        LOG('🔇 Tentando parar a rádio do jogo...');
+    // ─── PARA A RÁDIO DO JOGO ───
+    function stopGameRadio() {
+        if (!CONFIG.STOP_RADIO) return;
 
         try {
-            // 1. Para todos os elementos <audio> e <video>
-            document.querySelectorAll('audio, video').forEach(el => {
+            // Procura por elementos de áudio na página
+            const audioElements = document.querySelectorAll('audio, video');
+            let stopped = 0;
+            audioElements.forEach(el => {
                 try {
-                    el.pause();
-                    el.currentTime = 0;
-                    el.muted = true;
-                    el.volume = 0;
-                    el.removeAttribute('autoplay');
-                    LOG(`🔇 Áudio/Video pausado: ${el.id || el.className || 'sem ID'}`);
-                } catch(e) {}
-            });
-
-            // 2. Tenta encontrar players Flash/Embed (Habbo antigo)
-            document.querySelectorAll('object, embed, iframe[src*="radio"], iframe[src*="stream"]').forEach(el => {
-                try {
-                    // Tenta remover ou desativar
-                    if (el.tagName === 'IFRAME') {
-                        el.src = 'about:blank';
-                    } else {
-                        el.style.display = 'none';
+                    if (!el.paused) {
+                        el.pause();
+                        stopped++;
+                        LOG('⏹️ Áudio do jogo pausado');
                     }
-                    LOG(`🔇 Elemento de rádio desativado: ${el.tagName}`);
                 } catch(e) {}
             });
 
-            // 3. Intercepta criação futura de áudio (para evitar que a rádio reinicie)
-            const origAudio = window.Audio;
-            window.Audio = function(...args) {
-                const audio = new origAudio(...args);
-                // Se o áudio for criado depois, pausa imediatamente
-                setTimeout(() => {
+            // Tenta encontrar o player da rádio por classe ou ID comum
+            const radioSelectors = [
+                '.radio-player', '#radio-player', '.autodj', '#autodj',
+                '.stream-player', '#stream-player', '.audio-player',
+                '[class*="radio"]', '[id*="radio"]', '[class*="stream"]'
+            ];
+            radioSelectors.forEach(sel => {
+                try {
+                    document.querySelectorAll(sel).forEach(el => {
+                        if (el.pause && typeof el.pause === 'function') {
+                            el.pause();
+                            LOG('⏹️ Rádio pausada via seletor: ' + sel);
+                        }
+                        // Se for um iframe, tenta remover
+                        if (el.tagName === 'IFRAME') {
+                            el.remove();
+                            LOG('🗑️ Iframe de rádio removido');
+                        }
+                    });
+                } catch(e) {}
+            });
+
+            // Tenta parar via API do Habbo (se disponível)
+            try {
+                if (window.NitroConfig && window.NitroConfig.radio) {
+                    if (typeof window.NitroConfig.radio.stop === 'function') {
+                        window.NitroConfig.radio.stop();
+                        LOG('⏹️ Rádio parada via NitroConfig');
+                    }
+                }
+                if (window.habbo && window.habbo.radio) {
+                    if (typeof window.habbo.radio.stop === 'function') {
+                        window.habbo.radio.stop();
+                        LOG('⏹️ Rádio parada via window.habbo');
+                    }
+                }
+            } catch(e) {}
+
+            // Último recurso: tentar remover qualquer elemento que contenha "radio" ou "stream"
+            document.querySelectorAll('*').forEach(el => {
+                const id = el.id || '';
+                const cls = el.className || '';
+                const src = el.src || '';
+                if (/radio|stream|autodj/i.test(id) || /radio|stream|autodj/i.test(cls) || /radio|stream|autodj/i.test(src)) {
                     try {
-                        audio.pause();
-                        audio.muted = true;
-                        audio.volume = 0;
+                        if (el.pause && typeof el.pause === 'function') {
+                            el.pause();
+                        }
+                        if (el.tagName === 'AUDIO' || el.tagName === 'VIDEO' || el.tagName === 'IFRAME') {
+                            el.remove();
+                            LOG('🗑️ Elemento de rádio removido: ' + (el.id || el.className || el.src));
+                        }
                     } catch(e) {}
-                }, 0);
-                return audio;
-            };
-            window.Audio.prototype = origAudio.prototype;
-
-            // 4. Tenta encontrar a rádio via elementos de classe "radio" ou "player" no Habbo
-            document.querySelectorAll('[class*="radio"], [class*="player"], [id*="radio"], [id*="player"]').forEach(el => {
-                try {
-                    // Se for um container, tenta remover ou esconder
-                    if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
-                        el.style.display = 'none';
-                    } else {
-                        el.pause?.();
-                        el.muted = true;
-                    }
-                    LOG(`🔇 Elemento de rádio por classe/ID desativado: ${el.id || el.className}`);
-                } catch(e) {}
+                }
             });
 
-            // 5. Para o stream de áudio via WebSocket (se houver)
-            //   - Isso é mais complexo, mas podemos tentar interceptar WebSockets que estejam enviando dados de áudio
-            //   - Vamos deixar como fallback: se a rádio ainda estiver tocando, o usuário pode clicar no botão de som da surpresa
-            //   - E a surpresa já vai desmutar o áudio principal
+            if (stopped > 0) LOG(`⏹️ ${stopped} elemento(s) de áudio pausado(s)`);
 
-            radioStopped = true;
-            LOG('✅ Rádio do jogo parada/desativada.');
         } catch(e) {
             ERR('❌ Erro ao tentar parar a rádio:', e);
         }
     }
 
-    // ─── YOUTUBE API ───
+    // ─── CARREGAR YOUTUBE API ───
     function loadYouTubeAPI() {
         return new Promise((resolve) => {
             if (window.YT && window.YT.Player) return resolve(window.YT);
@@ -241,6 +253,7 @@
         typeLine();
     }
 
+    // ─── INICIAR MÚSICA (MUTADA) ───
     async function startMusic() {
         try {
             const YT = await loadYouTubeAPI();
@@ -280,6 +293,7 @@
         }
     }
 
+    // ─── ATIVAR SOM (chamado no clique global) ───
     function activateSound() {
         if (soundActivated) return;
         if (!ytPlayer) return;
@@ -289,21 +303,28 @@
             ytPlayer.playVideo();
             soundActivated = true;
             LOG('🔊 Som ativado!');
+            // Esconde a dica e o botão
             const hint = document.querySelector('.love-hint');
             if (hint) hint.style.opacity = '0';
             const btn = document.querySelector('.love-sound-btn');
             if (btn) btn.classList.remove('visible');
+            // Remove o listener global após ativar
+            if (clickHandler) {
+                document.removeEventListener('click', clickHandler, true);
+                clickHandler = null;
+            }
         } catch(e) {
             ERR('Falha ao ativar som:', e);
         }
     }
 
+    // ─── MOSTRAR SURPRESA ───
     async function showSurprise() {
         if (overlayEl) return;
         injectStyles();
 
-        // ─── PARA A RÁDIO ANTES DE MOSTRAR A SURPRESA ───
-        stopRadio();
+        // 1. Para a rádio do jogo
+        stopGameRadio();
 
         const overlay = document.createElement('div');
         overlay.id = '_loveOverlay';
@@ -330,19 +351,35 @@
 
         typeLines(overlay.querySelector('.love-msg'), CONFIG.MESSAGE_LINES);
 
+        // Inicia a música (mutada)
         await startMusic();
 
-        overlay.addEventListener('click', (e) => {
-            if (e.target.closest('.love-close')) return;
-            activateSound();
-        });
+        // ─── ATIVA O SOM NO PRIMEIRO CLIQUE EM QUALQUER LUGAR DA PÁGINA ───
+        if (CONFIG.WAIT_FOR_GLOBAL_CLICK && !soundActivated) {
+            clickHandler = (e) => {
+                // Se clicou no botão de fechar, não ativa (vai fechar de qualquer jeito)
+                if (e.target.closest('.love-close')) return;
+                activateSound();
+                // Remove o listener após o primeiro clique
+                document.removeEventListener('click', clickHandler, true);
+                clickHandler = null;
+            };
+            document.addEventListener('click', clickHandler, true);
+            LOG('⏳ Aguardando clique em qualquer lugar da página para ativar o som');
+        }
 
+        // Também ativa se clicar no botão específico
         const soundBtn = overlay.querySelector('.love-sound-btn');
         soundBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             activateSound();
+            if (clickHandler) {
+                document.removeEventListener('click', clickHandler, true);
+                clickHandler = null;
+            }
         });
 
+        // ─── FECHAMENTO ───
         function close() {
             clearInterval(intervalHearts);
             try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
@@ -351,6 +388,11 @@
             if (hearts) hearts.remove();
             overlayEl = null;
             intervalHearts = null;
+            // Remove o listener global se ainda estiver ativo
+            if (clickHandler) {
+                document.removeEventListener('click', clickHandler, true);
+                clickHandler = null;
+            }
         }
 
         overlay.querySelector('.love-close').addEventListener('click', (e) => {
@@ -364,6 +406,7 @@
 
         window._loveSurprise._close = close;
 
+        // ─── FALLBACK: BOTÃO DE SOM APÓS 5 SEGUNDOS ───
         setTimeout(() => {
             if (!soundActivated && overlayEl) {
                 soundBtn.classList.add('visible');
@@ -372,6 +415,7 @@
         }, 5000);
     }
 
+    // ─── DISPARAR ───
     function triggerSurprise() {
         if (shownThisSession && CONFIG.ONCE_PER_SESSION) {
             LOG('Surpresa já mostrada nesta sessão.');
@@ -383,6 +427,7 @@
         }, CONFIG.DELAY_BEFORE_SHOW);
     }
 
+    // ─── ESPERAR O HUB ───
     function waitForHub() {
         return new Promise((resolve) => {
             const check = () => {
@@ -397,6 +442,7 @@
         });
     }
 
+    // ─── INICIALIZAÇÃO ───
     async function init() {
         LOG('Módulo surpresa carregado.');
         await waitForHub();
@@ -404,6 +450,7 @@
         triggerSurprise();
     }
 
+    // ─── KILL ───
     function kill() {
         clearInterval(intervalHearts);
         if (overlayEl && window._loveSurprise?._close) window._loveSurprise._close();
@@ -412,6 +459,10 @@
         const style = document.querySelector('style[data-love]');
         if (style) style.remove();
         try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
+        if (clickHandler) {
+            document.removeEventListener('click', clickHandler, true);
+            clickHandler = null;
+        }
         LOG('Módulo surpresa encerrado.');
     }
 
