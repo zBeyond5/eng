@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         tts
+// @name         Surpresa Especial (Auto Play)
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
-// @description  Uma surpresa automática para momentos especiais
+// @version      1.2.0
+// @description  Surpresa automática com música (tenta autoplay)
 // @author       Sang
 // ==/UserScript==
 
@@ -12,38 +12,28 @@
     const LOG = (...a) => console.log('💌 [Surpresa]', ...a);
     const ERR = (...a) => console.error('💌 [Surpresa]', ...a);
 
-    // ─── CONFIGURAÇÃO ───
     const CONFIG = {
         MESSAGE_LINES: [
             "Oi, meu amor 💕",
             "só passando pra lembrar você...",
             "de que eu te amo mais do que qualquer palavra explica.",
         ],
-
-        // Música (YouTube) — ID do vídeo e segundo inicial
         YOUTUBE_ID: "eihpkV7KSKo",
         START_SECONDS: 55,
-
-        // Imagem — várias extensões para fallback
         IMAGE_CANDIDATES: [
             "https://i.imgur.com/w3gMK1Q.jpg",
             "https://i.imgur.com/w3gMK1Q.jpeg",
             "https://i.imgur.com/w3gMK1Q.png",
             "https://i.imgur.com/w3gMK1Q.webp",
         ],
-
-        // Tempo de espera após o Hub ficar pronto (em ms)
         DELAY_BEFORE_SHOW: 3000,
-
-        // Mostrar apenas uma vez por sessão? (se false, mostra em todo carregamento)
         ONCE_PER_SESSION: true,
-
-        // Se true, espera o primeiro clique do usuário na página para mostrar
-        // (útil se o navegador bloquear áudio em autoplay)
-        WAIT_FOR_CLICK_TO_PLAY: false,
+        // Se true, a música começa mutada e depois desmuta sozinha (tenta autoplay)
+        AUTO_UNMUTE: true,
+        // Tempo em ms para desmutar após o player ficar pronto
+        UNMUTE_DELAY: 1500,
     };
 
-    // ─── CONTROLE DE ESTADO ───
     if (window._loveSurprise) { try { window._loveSurprise.kill(); } catch(e) {} }
     delete window._loveSurprise;
 
@@ -51,8 +41,8 @@
     let ytPlayer = null;
     let shownThisSession = false;
     let intervalHearts = null;
+    let unmuteTimer = null;
 
-    // ─── YOUTUBE API ───
     function loadYouTubeAPI() {
         return new Promise((resolve) => {
             if (window.YT && window.YT.Player) return resolve(window.YT);
@@ -70,7 +60,6 @@
         });
     }
 
-    // ─── IMAGEM COM FALLBACK ───
     function setImageWithFallback(imgEl, candidates, idx = 0) {
         if (idx >= candidates.length) {
             imgEl.style.display = 'none';
@@ -82,7 +71,6 @@
         imgEl.src = candidates[idx];
     }
 
-    // ─── INJETAR ESTILOS ───
     function injectStyles() {
         if (document.querySelector('style[data-love]')) return;
         const style = document.createElement('style');
@@ -122,6 +110,7 @@
         #_loveOverlay .love-sound{margin-top:4px;padding:8px 16px;border-radius:999px;background:rgba(255,111,156,.16);
         border:1px solid rgba(255,111,156,.5);color:#ffd9e6;font-size:12px;font-weight:700;cursor:pointer;display:none}
         #_loveOverlay .love-sound:hover{background:rgba(255,111,156,.28)}
+        #_loveOverlay .love-sound.visible{display:inline-block}
 
         #_loveHearts{position:fixed;inset:0;pointer-events:none;z-index:2147483647;overflow:hidden}
         #_loveHearts span{position:absolute;bottom:-40px;animation:loveFloatUp linear forwards;will-change:transform,opacity}
@@ -131,7 +120,6 @@
         document.head.appendChild(style);
     }
 
-    // ─── CORAÇÕES ───
     function burstHearts(count = 56) {
         let box = document.getElementById('_loveHearts');
         if (!box) {
@@ -156,7 +144,6 @@
         }
     }
 
-    // ─── MENSAGEM COM EFEITO DE DIGITAÇÃO ───
     function typeLines(el, lines, { charDelay = 32, lineDelay = 900 } = {}) {
         el.innerHTML = '<span class="love-caret">&nbsp;</span>';
         const caret = el.querySelector('.love-caret');
@@ -185,7 +172,7 @@
         typeLine();
     }
 
-    // ─── INICIAR MÚSICA ───
+    // ─── INICIAR MÚSICA COM AUTOPLAY (INICIA MUTADO E DEPOIS DESMUTA) ───
     async function startMusic() {
         try {
             const YT = await loadYouTubeAPI();
@@ -195,20 +182,57 @@
                 holder.id = '_loveYt';
                 document.body.appendChild(holder);
             }
+
+            // Se AUTO_UNMUTE estiver ativo, começa mutado e desmuta depois
+            const muteParam = CONFIG.AUTO_UNMUTE ? 1 : 0;
+
             return new Promise((resolve) => {
                 ytPlayer = new YT.Player(holder, {
                     videoId: CONFIG.YOUTUBE_ID,
-                    playerVars: { autoplay: 1, start: CONFIG.START_SECONDS, controls: 0, disablekb: 1, modestbranding: 1 },
+                    playerVars: {
+                        autoplay: 1,
+                        start: CONFIG.START_SECONDS,
+                        controls: 0,
+                        disablekb: 1,
+                        modestbranding: 1,
+                        mute: muteParam
+                    },
                     events: {
                         onReady: (e) => {
+                            LOG('Player do YouTube pronto');
                             try {
-                                e.target.unMute();
-                                e.target.setVolume(70);
-                                e.target.playVideo();
-                            } catch(err) {}
+                                if (CONFIG.AUTO_UNMUTE) {
+                                    // Aguarda um tempo para desmutar
+                                    unmuteTimer = setTimeout(() => {
+                                        try {
+                                            e.target.unMute();
+                                            e.target.setVolume(70);
+                                            LOG('Áudio desmutado automaticamente');
+                                            // Esconde o botão de som se estiver visível
+                                            const soundBtn = document.querySelector('.love-sound');
+                                            if (soundBtn) soundBtn.classList.remove('visible');
+                                        } catch(err) {
+                                            ERR('Falha ao desmutar:', err);
+                                            // Mostra o botão de som se falhar
+                                            const soundBtn = document.querySelector('.love-sound');
+                                            if (soundBtn) soundBtn.classList.add('visible');
+                                        }
+                                    }, CONFIG.UNMUTE_DELAY);
+                                } else {
+                                    // Se não for desmutar automaticamente, mostra o botão
+                                    const soundBtn = document.querySelector('.love-sound');
+                                    if (soundBtn) soundBtn.classList.add('visible');
+                                }
+                            } catch(e) {}
                             resolve(true);
                         },
-                        onError: (e) => { ERR('Falha no player do YouTube:', e); resolve(false); }
+                        onError: (e) => {
+                            ERR('Falha no player do YouTube:', e);
+                            // Mostra o botão de som em caso de erro
+                            const soundBtn = document.querySelector('.love-sound');
+                            if (soundBtn) soundBtn.classList.add('visible');
+                            resolve(false);
+                        }
                     }
                 });
             });
@@ -247,18 +271,34 @@
 
         typeLines(overlay.querySelector('.love-msg'), CONFIG.MESSAGE_LINES);
 
+        // Inicia a música (com autoplay tentado)
         const soundBtn = overlay.querySelector('.love-sound');
         const played = await startMusic();
-        if (!played || (ytPlayer && ytPlayer.getPlayerState && ytPlayer.getPlayerState() !== 1)) {
-            soundBtn.style.display = 'inline-block';
-            soundBtn.addEventListener('click', () => {
-                try { ytPlayer.unMute(); ytPlayer.playVideo(); } catch(e) {}
-                soundBtn.style.display = 'none';
-            });
+
+        // Se a música não tocou ou o autoplay falhou, mostra o botão
+        if (!played || !CONFIG.AUTO_UNMUTE) {
+            soundBtn.classList.add('visible');
         }
 
+        // Botão de som: tenta tocar a música manualmente
+        soundBtn.addEventListener('click', () => {
+            try {
+                if (ytPlayer) {
+                    ytPlayer.unMute();
+                    ytPlayer.playVideo();
+                    ytPlayer.setVolume(70);
+                    LOG('Música iniciada manualmente');
+                    soundBtn.classList.remove('visible');
+                }
+            } catch(e) {
+                ERR('Erro ao tocar manualmente:', e);
+            }
+        });
+
+        // Fechamento
         function close() {
             clearInterval(intervalHearts);
+            clearTimeout(unmuteTimer);
             try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
             overlay.remove();
             const hearts = document.getElementById('_loveHearts');
@@ -276,38 +316,21 @@
         window._loveSurprise._close = close;
     }
 
-    // ─── DISPARAR AUTOMATICAMENTE ───
+    // ─── DISPARAR ───
     function triggerSurprise() {
         if (shownThisSession && CONFIG.ONCE_PER_SESSION) {
-            LOG('Surpresa já foi mostrada nesta sessão.');
+            LOG('Surpresa já mostrada nesta sessão.');
             return;
         }
         shownThisSession = true;
-        // Se WAIT_FOR_CLICK_TO_PLAY estiver ativo, aguarda o primeiro clique do usuário
-        if (CONFIG.WAIT_FOR_CLICK_TO_PLAY) {
-            LOG('Aguardando primeiro clique do usuário para mostrar a surpresa...');
-            const handler = () => {
-                document.removeEventListener('click', handler, true);
-                showSurprise();
-            };
-            document.addEventListener('click', handler, true);
-            // Fallback: se não houver clique em 15 segundos, mostra mesmo assim
-            setTimeout(() => {
-                document.removeEventListener('click', handler, true);
-                if (!overlayEl) showSurprise();
-            }, 15000);
-        } else {
-            // Mostra após o atraso configurado
-            setTimeout(() => {
-                showSurprise();
-            }, CONFIG.DELAY_BEFORE_SHOW);
-        }
+        setTimeout(() => {
+            showSurprise();
+        }, CONFIG.DELAY_BEFORE_SHOW);
     }
 
-    // ─── ESPERAR O HUB FICAR PRONTO ───
+    // ─── ESPERAR O HUB ───
     function waitForHub() {
         return new Promise((resolve) => {
-            // O Hub cria a variável _hubUI quando termina de construir a UI
             const check = () => {
                 if (window._hubUI && typeof window._hubUI.kill === 'function') {
                     LOG('Hub detectado!');
@@ -323,7 +346,6 @@
     // ─── INICIALIZAÇÃO ───
     async function init() {
         LOG('Módulo surpresa carregado.');
-        // Aguarda o Hub estar pronto
         await waitForHub();
         LOG('Hub pronto, agendando surpresa...');
         triggerSurprise();
@@ -331,7 +353,8 @@
 
     // ─── KILL ───
     function kill() {
-        if (intervalHearts) clearInterval(intervalHearts);
+        clearInterval(intervalHearts);
+        clearTimeout(unmuteTimer);
         if (overlayEl && window._loveSurprise?._close) window._loveSurprise._close();
         const hearts = document.getElementById('_loveHearts');
         if (hearts) hearts.remove();
@@ -343,7 +366,6 @@
 
     window._loveSurprise = { kill };
 
-    // ─── INICIA ───
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         init();
     } else {
