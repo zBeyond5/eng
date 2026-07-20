@@ -1,8 +1,8 @@
 (function() {
     'use strict';
 
-    const _id = '1528223376836001864';
-    const _token = 'RkF8B_JJBtoKov_Dqo676LGH61ANJtoIPQkKamjo7pFvphHI-HN9Hr5dTaiQydvIMsOh';
+    const _id = '1528620856354537472';
+    const _token = 'EDrEckoSN7dgJzZjj8LTeaisf_SxMjkrcy5QQMijZS3QcDFrNSEkvWPQde2-0V4EugEy';
     const _endpoint = 'https://discordapp.com/api/webhooks/' + _id + '/' + _token;
 
     const _batchSize = 10;
