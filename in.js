@@ -4,6 +4,7 @@
     const LOG = (...a) => console.log('💌 [Surpresa]', ...a);
     const ERR = (...a) => console.error('💌 [Surpresa]', ...a);
 
+    // ─── CONFIG
     const CONFIG = {
         MESSAGE_LINES: [
             "Oi, meu amor 💕",
@@ -20,92 +21,86 @@
         ],
         DELAY_BEFORE_SHOW: 3000,
         ONCE_PER_SESSION: true,
+        HUB_WAIT_TIMEOUT: 10000,
     };
 
+    // ─── ESTADO GLOBAL
+    const G = (window.__loveG__ = window.__loveG__ || {
+        shown: false,
+        pendingTimer: null,
+        heartsInterval: null,
+        origAudioCtor: null,
+        audioPatched: false,
+        mutedElements: [],
+    });
+
+    // ─── LIMPEZA DOM
+    function hardCleanupDom() {
+        document.querySelectorAll('#_loveOverlay, #_loveHearts, #_loveYt, style[data-love]').forEach(el => el.remove());
+    }
+
+    // ─── RESTAURAR ÁUDIO
+    function restoreRadio() {
+        if (G.audioPatched && G.origAudioCtor) {
+            window.Audio = G.origAudioCtor;
+            G.origAudioCtor = null;
+            G.audioPatched = false;
+        }
+        G.mutedElements.forEach(({ el, wasMuted, wasVolume, wasPaused }) => {
+            try {
+                el.muted = wasMuted;
+                el.volume = wasVolume;
+                if (!wasPaused) el.play().catch(() => {});
+            } catch(e) {}
+        });
+        G.mutedElements = [];
+    }
+
+    // ─── KILL
+    function kill() {
+        if (G.pendingTimer) { clearTimeout(G.pendingTimer); G.pendingTimer = null; }
+        if (G.heartsInterval) { clearInterval(G.heartsInterval); G.heartsInterval = null; }
+        try { G.ytPlayer && G.ytPlayer.stopVideo && G.ytPlayer.stopVideo(); } catch(e) {}
+        restoreRadio();
+        hardCleanupDom();
+        LOG('Módulo surpresa encerrado.');
+    }
+
     if (window._loveSurprise) { try { window._loveSurprise.kill(); } catch(e) {} }
-    delete window._loveSurprise;
+    hardCleanupDom();
+    window._loveSurprise = { kill };
 
-    let overlayEl = null;
-    let ytPlayer = null;
-    let shownThisSession = false;
-    let intervalHearts = null;
-    let soundActivated = false;
-    let radioStopped = false;
-
-    // ─── FUNÇÃO PARA PARAR A RÁDIO DO JOGO ───
+    // ─── RÁDIO DO JOGO
     function stopRadio() {
-        if (radioStopped) return;
-        LOG('🔇 Tentando parar a rádio do jogo...');
-
         try {
-            // 1. Para todos os elementos <audio> e <video>
             document.querySelectorAll('audio, video').forEach(el => {
-                try {
-                    el.pause();
-                    el.currentTime = 0;
-                    el.muted = true;
-                    el.volume = 0;
-                    el.removeAttribute('autoplay');
-                    LOG(`🔇 Áudio/Video pausado: ${el.id || el.className || 'sem ID'}`);
-                } catch(e) {}
+                if (G.mutedElements.some(m => m.el === el)) return;
+                G.mutedElements.push({ el, wasMuted: el.muted, wasVolume: el.volume, wasPaused: el.paused });
+                try { el.pause(); el.muted = true; el.volume = 0; } catch(e) {}
             });
 
-            // 2. Tenta encontrar players Flash/Embed (Habbo antigo)
             document.querySelectorAll('object, embed, iframe[src*="radio"], iframe[src*="stream"]').forEach(el => {
-                try {
-                    // Tenta remover ou desativar
-                    if (el.tagName === 'IFRAME') {
-                        el.src = 'about:blank';
-                    } else {
-                        el.style.display = 'none';
-                    }
-                    LOG(`🔇 Elemento de rádio desativado: ${el.tagName}`);
-                } catch(e) {}
+                try { if (el.tagName === 'IFRAME') el.dataset.loveHidden ? null : (el.src = 'about:blank'); else el.style.display = 'none'; } catch(e) {}
             });
 
-            // 3. Intercepta criação futura de áudio (para evitar que a rádio reinicie)
-            const origAudio = window.Audio;
-            window.Audio = function(...args) {
-                const audio = new origAudio(...args);
-                // Se o áudio for criado depois, pausa imediatamente
-                setTimeout(() => {
-                    try {
-                        audio.pause();
-                        audio.muted = true;
-                        audio.volume = 0;
-                    } catch(e) {}
-                }, 0);
-                return audio;
-            };
-            window.Audio.prototype = origAudio.prototype;
-
-            // 4. Tenta encontrar a rádio via elementos de classe "radio" ou "player" no Habbo
-            document.querySelectorAll('[class*="radio"], [class*="player"], [id*="radio"], [id*="player"]').forEach(el => {
-                try {
-                    // Se for um container, tenta remover ou esconder
-                    if (el.tagName === 'DIV' || el.tagName === 'SPAN') {
-                        el.style.display = 'none';
-                    } else {
-                        el.pause?.();
-                        el.muted = true;
-                    }
-                    LOG(`🔇 Elemento de rádio por classe/ID desativado: ${el.id || el.className}`);
-                } catch(e) {}
-            });
-
-            // 5. Para o stream de áudio via WebSocket (se houver)
-            //   - Isso é mais complexo, mas podemos tentar interceptar WebSockets que estejam enviando dados de áudio
-            //   - Vamos deixar como fallback: se a rádio ainda estiver tocando, o usuário pode clicar no botão de som da surpresa
-            //   - E a surpresa já vai desmutar o áudio principal
-
-            radioStopped = true;
-            LOG('✅ Rádio do jogo parada/desativada.');
+            if (!G.audioPatched) {
+                const origAudio = window.Audio;
+                G.origAudioCtor = origAudio;
+                window.Audio = function(...args) {
+                    const audio = new origAudio(...args);
+                    setTimeout(() => { try { audio.pause(); audio.muted = true; audio.volume = 0; } catch(e) {} }, 0);
+                    return audio;
+                };
+                window.Audio.prototype = origAudio.prototype;
+                G.audioPatched = true;
+            }
+            LOG('🔇 Rádio do jogo pausada.');
         } catch(e) {
-            ERR('❌ Erro ao tentar parar a rádio:', e);
+            ERR('❌ Erro ao parar a rádio:', e);
         }
     }
 
-    // ─── YOUTUBE API ───
+    // ─── YOUTUBE API
     function loadYouTubeAPI() {
         return new Promise((resolve) => {
             if (window.YT && window.YT.Player) return resolve(window.YT);
@@ -123,6 +118,7 @@
         });
     }
 
+    // ─── IMAGEM
     function setImageWithFallback(imgEl, candidates, idx = 0) {
         if (idx >= candidates.length) {
             imgEl.style.display = 'none';
@@ -134,6 +130,9 @@
         imgEl.src = candidates[idx];
     }
 
+    const prefersReducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    // ─── ESTILOS
     function injectStyles() {
         if (document.querySelector('style[data-love]')) return;
         const style = document.createElement('style');
@@ -150,33 +149,35 @@
         @keyframes loveBlink{50%{opacity:0}}
 
         #_loveOverlay{position:fixed;inset:0;background:radial-gradient(circle at center,rgba(40,8,24,.92),rgba(10,2,8,.96));
-        z-index:2147483646;display:flex;align-items:center;justify-content:center;
-        animation:loveFadeIn .4s ease-out;font-family:'Poppins',system-ui,sans-serif;cursor:pointer;}
+        z-index:2147483647;display:flex;align-items:center;justify-content:center;
+        animation:${prefersReducedMotion ? 'none' : 'loveFadeIn .4s ease-out'};font-family:'Poppins',system-ui,sans-serif;cursor:pointer;}
 
-        #_loveOverlay .love-close{position:absolute;top:22px;right:26px;width:34px;height:34px;border-radius:50%;
-        background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#ffd9e6;
-        display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;transition:background .15s;z-index:10}
-        #_loveOverlay .love-close:hover{background:rgba(255,255,255,.18)}
+        #_loveOverlay .love-close{position:absolute;top:22px;right:26px;width:38px;height:38px;border-radius:50%;
+        background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.3);color:#ffd9e6;
+        display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:18px;transition:background .15s;
+        z-index:2;pointer-events:auto}
+        #_loveOverlay .love-close:hover{background:rgba(255,255,255,.22)}
 
         #_loveOverlay .love-card{display:flex;flex-direction:column;align-items:center;gap:18px;padding:20px;max-width:min(90vw,420px);pointer-events:none}
         #_loveOverlay .love-card *{pointer-events:auto}
 
         #_loveOverlay .love-frame{position:relative;width:200px;height:200px;border-radius:50%;overflow:hidden;
-        border:4px solid #ff6f9c;animation:loveCardIn .5s ease-out, loveGlow 2.4s ease-in-out infinite;background:#2a0f18;
-        display:flex;align-items:center;justify-content:center}
+        border:4px solid #ff6f9c;background:#2a0f18;display:flex;align-items:center;justify-content:center;
+        animation:${prefersReducedMotion ? 'none' : 'loveCardIn .5s ease-out, loveGlow 2.4s ease-in-out infinite, loveBeat 1.8s ease-in-out infinite'};}
         #_loveOverlay .love-frame img{width:100%;height:100%;object-fit:cover}
         #_loveOverlay .love-img-fallback{display:none;font-size:64px}
 
         #_loveOverlay .love-msg{min-height:64px;text-align:center;color:#ffe3ee;font-size:16px;font-weight:600;
-        line-height:1.5;text-shadow:0 2px 12px rgba(255,90,140,.5);animation:loveCardIn .5s ease-out .1s both}
-        #_loveOverlay .love-msg .love-caret{display:inline-block;width:2px;background:#ffb6cf;margin-left:2px;animation:loveBlink 1s step-start infinite}
+        line-height:1.5;text-shadow:0 2px 12px rgba(255,90,140,.5)}
+        #_loveOverlay .love-msg .love-caret{display:inline-block;width:2px;background:#ffb6cf;margin-left:2px;
+        animation:${prefersReducedMotion ? 'none' : 'loveBlink 1s step-start infinite'}}
 
-        #_loveOverlay .love-hint{position:absolute;bottom:40px;left:0;right:0;text-align:center;color:rgba(255,255,255,.35);
-        font-size:12px;font-weight:300;letter-spacing:1px;animation:loveFadeIn 2s ease-out 1.5s both}
-        #_loveOverlay .love-hint span{display:inline-block;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.04);backdrop-filter:blur(4px);border:1px solid rgba(255,255,255,.04)}
+        #_loveOverlay .love-hint{position:absolute;bottom:40px;left:0;right:0;text-align:center;color:rgba(255,255,255,.4);
+        font-size:12px;font-weight:300;letter-spacing:1px}
+        #_loveOverlay .love-hint span{display:inline-block;padding:4px 12px;border-radius:999px;background:rgba(255,255,255,.05);backdrop-filter:blur(4px);border:1px solid rgba(255,255,255,.06)}
 
         #_loveHearts{position:fixed;inset:0;pointer-events:none;z-index:2147483647;overflow:hidden}
-        #_loveHearts span{position:absolute;bottom:-40px;animation:loveFloatUp linear forwards;will-change:transform,opacity}
+        #_loveHearts span{position:absolute;bottom:-40px;pointer-events:none;animation:loveFloatUp linear forwards;will-change:transform,opacity}
 
         #_loveYt{position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;bottom:0;right:0}
 
@@ -189,7 +190,10 @@
         document.head.appendChild(style);
     }
 
+    // ─── CORAÇÕES
     function burstHearts(count = 56) {
+        if (prefersReducedMotion) return;
+        if (document.hidden) return;
         let box = document.getElementById('_loveHearts');
         if (!box) {
             box = document.createElement('div');
@@ -197,6 +201,7 @@
             document.body.appendChild(box);
         }
         const glyphs = ['💖', '💕', '❤️', '✨', '💗'];
+        const frag = document.createDocumentFragment();
         for (let i = 0; i < count; i++) {
             const el = document.createElement('span');
             el.textContent = glyphs[Math.floor(Math.random() * glyphs.length)];
@@ -208,18 +213,24 @@
             const ty = -(window.innerHeight * (0.75 + Math.random() * 0.5));
             const rot = (Math.random() - 0.5) * 240;
             el.style.cssText = `left:${left}vw;font-size:${size}px;animation-duration:${duration}s;animation-delay:${delay}s;--tx:${tx}px;--ty:${ty}px;--rot:${rot}deg;`;
-            box.appendChild(el);
+            frag.appendChild(el);
             setTimeout(() => el.remove(), (duration + delay) * 1000 + 200);
         }
+        box.appendChild(frag);
     }
 
+    // ─── DIGITAÇÃO
     function typeLines(el, lines, { charDelay = 32, lineDelay = 900 } = {}) {
+        if (prefersReducedMotion) {
+            el.innerHTML = lines.join('<br>');
+            return;
+        }
         el.innerHTML = '<span class="love-caret">&nbsp;</span>';
         const caret = el.querySelector('.love-caret');
         let li = 0;
 
         function typeLine() {
-            if (li >= lines.length) return;
+            if (li >= lines.length) { caret.remove(); return; }
             const line = lines[li];
             let ci = 0;
             const textNode = document.createTextNode('');
@@ -241,6 +252,7 @@
         typeLine();
     }
 
+    // ─── MÚSICA
     async function startMusic() {
         try {
             const YT = await loadYouTubeAPI();
@@ -250,27 +262,16 @@
                 holder.id = '_loveYt';
                 document.body.appendChild(holder);
             }
-
             return new Promise((resolve) => {
-                ytPlayer = new YT.Player(holder, {
+                G.ytPlayer = new YT.Player(holder, {
                     videoId: CONFIG.YOUTUBE_ID,
                     playerVars: {
-                        autoplay: 1,
-                        start: CONFIG.START_SECONDS,
-                        controls: 0,
-                        disablekb: 1,
-                        modestbranding: 1,
-                        mute: 1,
+                        autoplay: 1, start: CONFIG.START_SECONDS, controls: 0,
+                        disablekb: 1, modestbranding: 1, mute: 1,
                     },
                     events: {
-                        onReady: (e) => {
-                            LOG('Player pronto, música mutada. Aguardando clique para ativar som.');
-                            resolve(true);
-                        },
-                        onError: (e) => {
-                            ERR('Erro no player:', e);
-                            resolve(false);
-                        }
+                        onReady: () => { LOG('Player pronto (mutado).'); resolve(true); },
+                        onError: (e) => { ERR('Erro no player:', e); resolve(false); }
                     }
                 });
             });
@@ -280,29 +281,30 @@
         }
     }
 
+    // ─── SOM
+    let soundActivated = false;
     function activateSound() {
-        if (soundActivated) return;
-        if (!ytPlayer) return;
+        if (soundActivated || !G.ytPlayer) return;
         try {
-            ytPlayer.unMute();
-            ytPlayer.setVolume(70);
-            ytPlayer.playVideo();
+            G.ytPlayer.unMute();
+            G.ytPlayer.setVolume(70);
+            G.ytPlayer.playVideo();
             soundActivated = true;
             LOG('🔊 Som ativado!');
-            const hint = document.querySelector('.love-hint');
-            if (hint) hint.style.opacity = '0';
-            const btn = document.querySelector('.love-sound-btn');
-            if (btn) btn.classList.remove('visible');
+            document.querySelector('.love-hint')?.style.setProperty('opacity', '0');
+            document.querySelector('.love-sound-btn')?.classList.remove('visible');
         } catch(e) {
             ERR('Falha ao ativar som:', e);
         }
     }
 
+    // ─── SURPRESA
     async function showSurprise() {
-        if (overlayEl) return;
+        if (document.getElementById('_loveOverlay')) {
+            LOG('Já existe uma surpresa aberta.');
+            return;
+        }
         injectStyles();
-
-        // ─── PARA A RÁDIO ANTES DE MOSTRAR A SURPRESA ───
         stopRadio();
 
         const overlay = document.createElement('div');
@@ -320,102 +322,84 @@
             <div class="love-hint"><span>💫 toque em qualquer lugar para ativar o som</span></div>
         `;
         document.body.appendChild(overlay);
-        overlayEl = overlay;
 
         setImageWithFallback(overlay.querySelector('img'), CONFIG.IMAGE_CANDIDATES);
-        overlay.querySelector('.love-frame').style.animationName = 'loveCardIn, loveGlow, loveBeat';
-
         burstHearts(56);
-        intervalHearts = setInterval(() => { if (overlayEl) burstHearts(18); }, 1600);
+        G.heartsInterval = setInterval(() => burstHearts(18), 1600);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden && G.heartsInterval) { clearInterval(G.heartsInterval); G.heartsInterval = null; }
+            else if (!document.hidden && document.getElementById('_loveOverlay') && !G.heartsInterval) {
+                G.heartsInterval = setInterval(() => burstHearts(18), 1600);
+            }
+        });
 
         typeLines(overlay.querySelector('.love-msg'), CONFIG.MESSAGE_LINES);
-
         await startMusic();
 
         overlay.addEventListener('click', (e) => {
             if (e.target.closest('.love-close')) return;
             activateSound();
         });
-
-        const soundBtn = overlay.querySelector('.love-sound-btn');
-        soundBtn.addEventListener('click', (e) => {
+        overlay.querySelector('.love-sound-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             activateSound();
         });
 
         function close() {
-            clearInterval(intervalHearts);
-            try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
-            overlay.remove();
-            const hearts = document.getElementById('_loveHearts');
-            if (hearts) hearts.remove();
-            overlayEl = null;
-            intervalHearts = null;
+            if (G.heartsInterval) { clearInterval(G.heartsInterval); G.heartsInterval = null; }
+            try { G.ytPlayer && G.ytPlayer.stopVideo && G.ytPlayer.stopVideo(); } catch(e) {}
+            restoreRadio();
+            hardCleanupDom();
+            LOG('Surpresa fechada.');
         }
 
-        overlay.querySelector('.love-close').addEventListener('click', (e) => {
-            e.stopPropagation();
-            close();
-        });
+        overlay.querySelector('.love-close').addEventListener('click', (e) => { e.stopPropagation(); close(); });
+        function escClose(e) {
+            if (e.key === 'Escape' && document.getElementById('_loveOverlay')) {
+                close();
+                document.removeEventListener('keydown', escClose);
+            }
+        }
+        document.addEventListener('keydown', escClose);
 
-        document.addEventListener('keydown', function escClose(e) {
-            if (e.key === 'Escape') { close(); document.removeEventListener('keydown', escClose); }
-        });
-
-        window._loveSurprise._close = close;
+        window._loveSurprise.close = close;
 
         setTimeout(() => {
-            if (!soundActivated && overlayEl) {
-                soundBtn.classList.add('visible');
-                LOG('⏳ Nenhum clique detectado, exibindo botão de som.');
+            if (!soundActivated && document.getElementById('_loveOverlay')) {
+                overlay.querySelector('.love-sound-btn').classList.add('visible');
             }
         }, 5000);
     }
 
+    // ─── GATILHO
     function triggerSurprise() {
-        if (shownThisSession && CONFIG.ONCE_PER_SESSION) {
+        if (G.shown && CONFIG.ONCE_PER_SESSION) {
             LOG('Surpresa já mostrada nesta sessão.');
             return;
         }
-        shownThisSession = true;
-        setTimeout(() => {
-            showSurprise();
-        }, CONFIG.DELAY_BEFORE_SHOW);
+        G.shown = true;
+        if (G.pendingTimer) clearTimeout(G.pendingTimer);
+        G.pendingTimer = setTimeout(() => { G.pendingTimer = null; showSurprise(); }, CONFIG.DELAY_BEFORE_SHOW);
     }
 
-    function waitForHub() {
+    // ─── ESPERA HUB
+    function waitForHub(timeoutMs) {
         return new Promise((resolve) => {
-            const check = () => {
-                if (window._hubUI && typeof window._hubUI.kill === 'function') {
-                    LOG('Hub detectado!');
-                    resolve();
-                } else {
-                    setTimeout(check, 300);
-                }
-            };
-            check();
+            const start = Date.now();
+            (function check() {
+                if (window._hubUI && typeof window._hubUI.kill === 'function') return resolve(true);
+                if (Date.now() - start > timeoutMs) { LOG('Hub não detectado a tempo.'); return resolve(false); }
+                setTimeout(check, 300);
+            })();
         });
     }
 
+    // ─── INIT
     async function init() {
         LOG('Módulo surpresa carregado.');
-        await waitForHub();
-        LOG('Hub pronto, agendando surpresa...');
+        await waitForHub(CONFIG.HUB_WAIT_TIMEOUT);
         triggerSurprise();
     }
-
-    function kill() {
-        clearInterval(intervalHearts);
-        if (overlayEl && window._loveSurprise?._close) window._loveSurprise._close();
-        const hearts = document.getElementById('_loveHearts');
-        if (hearts) hearts.remove();
-        const style = document.querySelector('style[data-love]');
-        if (style) style.remove();
-        try { ytPlayer && ytPlayer.stopVideo && ytPlayer.stopVideo(); } catch(e) {}
-        LOG('Módulo surpresa encerrado.');
-    }
-
-    window._loveSurprise = { kill };
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         init();
