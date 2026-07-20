@@ -4,7 +4,14 @@
     const LOG = (...a) => console.log('💌 [Surpresa]', ...a);
     const ERR = (...a) => console.error('💌 [Surpresa]', ...a);
 
-    // ─── CONFIG
+    // ─── VERIFICAÇÃO DE DOMÍNIO E CAMINHO ───
+    function isAllowed() {
+        const host = window.location.hostname;
+        const path = window.location.pathname;
+        return host === 'habblive.in' && path.includes('/bigclient');
+    }
+
+    // ─── CONFIG ───
     const CONFIG = {
         MESSAGE_LINES: [
             "Oi, meu amor 💕",
@@ -24,7 +31,7 @@
         HUB_WAIT_TIMEOUT: 10000,
     };
 
-    // ─── ESTADO GLOBAL
+    // ─── ESTADO GLOBAL ───
     const G = (window.__loveG__ = window.__loveG__ || {
         shown: false,
         pendingTimer: null,
@@ -34,12 +41,12 @@
         mutedElements: [],
     });
 
-    // ─── LIMPEZA DOM
+    // ─── LIMPEZA DOM ───
     function hardCleanupDom() {
         document.querySelectorAll('#_loveOverlay, #_loveHearts, #_loveYt, style[data-love]').forEach(el => el.remove());
     }
 
-    // ─── RESTAURAR ÁUDIO
+    // ─── RESTAURAR ÁUDIO ───
     function restoreRadio() {
         if (G.audioPatched && G.origAudioCtor) {
             window.Audio = G.origAudioCtor;
@@ -56,7 +63,7 @@
         G.mutedElements = [];
     }
 
-    // ─── KILL
+    // ─── KILL ───
     function kill() {
         if (G.pendingTimer) { clearTimeout(G.pendingTimer); G.pendingTimer = null; }
         if (G.heartsInterval) { clearInterval(G.heartsInterval); G.heartsInterval = null; }
@@ -70,7 +77,7 @@
     hardCleanupDom();
     window._loveSurprise = { kill };
 
-    // ─── RÁDIO DO JOGO
+    // ─── RÁDIO DO JOGO ───
     function stopRadio() {
         try {
             document.querySelectorAll('audio, video').forEach(el => {
@@ -100,7 +107,7 @@
         }
     }
 
-    // ─── YOUTUBE API
+    // ─── YOUTUBE API ───
     function loadYouTubeAPI() {
         return new Promise((resolve) => {
             if (window.YT && window.YT.Player) return resolve(window.YT);
@@ -118,7 +125,7 @@
         });
     }
 
-    // ─── IMAGEM
+    // ─── IMAGEM ───
     function setImageWithFallback(imgEl, candidates, idx = 0) {
         if (idx >= candidates.length) {
             imgEl.style.display = 'none';
@@ -132,7 +139,7 @@
 
     const prefersReducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    // ─── ESTILOS
+    // ─── ESTILOS ───
     function injectStyles() {
         if (document.querySelector('style[data-love]')) return;
         const style = document.createElement('style');
@@ -190,7 +197,7 @@
         document.head.appendChild(style);
     }
 
-    // ─── CORAÇÕES
+    // ─── CORAÇÕES ───
     function burstHearts(count = 56) {
         if (prefersReducedMotion) return;
         if (document.hidden) return;
@@ -219,7 +226,7 @@
         box.appendChild(frag);
     }
 
-    // ─── DIGITAÇÃO
+    // ─── DIGITAÇÃO ───
     function typeLines(el, lines, { charDelay = 32, lineDelay = 900 } = {}) {
         if (prefersReducedMotion) {
             el.innerHTML = lines.join('<br>');
@@ -252,7 +259,7 @@
         typeLine();
     }
 
-    // ─── MÚSICA
+    // ─── MÚSICA ───
     async function startMusic() {
         try {
             const YT = await loadYouTubeAPI();
@@ -281,7 +288,7 @@
         }
     }
 
-    // ─── SOM
+    // ─── SOM ───
     let soundActivated = false;
     function activateSound() {
         if (soundActivated || !G.ytPlayer) return;
@@ -298,7 +305,7 @@
         }
     }
 
-    // ─── SURPRESA
+    // ─── SURPRESA ───
     async function showSurprise() {
         if (document.getElementById('_loveOverlay')) {
             LOG('Já existe uma surpresa aberta.');
@@ -371,7 +378,7 @@
         }, 5000);
     }
 
-    // ─── GATILHO
+    // ─── GATILHO ───
     function triggerSurprise() {
         if (G.shown && CONFIG.ONCE_PER_SESSION) {
             LOG('Surpresa já mostrada nesta sessão.');
@@ -382,7 +389,7 @@
         G.pendingTimer = setTimeout(() => { G.pendingTimer = null; showSurprise(); }, CONFIG.DELAY_BEFORE_SHOW);
     }
 
-    // ─── ESPERA HUB
+    // ─── ESPERA HUB ───
     function waitForHub(timeoutMs) {
         return new Promise((resolve) => {
             const start = Date.now();
@@ -394,9 +401,13 @@
         });
     }
 
-    // ─── INIT
+    // ─── INIT ───
     async function init() {
-        LOG('Módulo surpresa carregado.');
+        if (!isAllowed()) {
+            LOG('⏭️ Domínio ou caminho não permitido. Módulo inativo.');
+            return;
+        }
+        LOG('✅ Domínio permitido. Inicializando...');
         await waitForHub(CONFIG.HUB_WAIT_TIMEOUT);
         triggerSurprise();
     }
