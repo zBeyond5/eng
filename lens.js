@@ -1,3 +1,14 @@
+// ==UserScript==
+// @name         lens — Chat Monitor
+// @namespace    http://tampermonkey.net/
+// @version      1.1.1
+// @description  Sniffer de chat Habbo com nomes + whisper + ações
+// @author       Sang
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
 (function() {
     'use strict';
 
@@ -13,7 +24,6 @@
     var _queue = [];
     var _isSending = false;
     var _virtualIdMap = {};
-    var _accountVirtualId = null;
     var _accountName = '';
     var _recentPackets = new Map();
     var _outboundCache = [];
@@ -168,17 +178,29 @@
             var view = new DataView(data);
             if (view.byteLength < 14) return null;
             var header = view.getUint16(4, false);
-            if (header !== 1146 && header !== 25) return null;
-            var virtualId = view.getUint16(8, false);
-            var msgLen = view.getUint16(10, false);
-            if (msgLen === 0 || msgLen > 2048 || 12 + msgLen > view.byteLength) return null;
-            var msgBytes = new Uint8Array(data, 12, msgLen);
+            if (header !== 1146 && header !== 25 && header !== 890) return null;
+            var offset = 6;
+            var targetId = null;
+            if (header === 890) {
+                targetId = view.getUint16(offset, false);
+                offset += 2;
+            }
+            var virtualId = view.getUint16(offset, false);
+            offset += 2;
+            var msgLen = view.getUint16(offset, false);
+            offset += 2;
+            if (msgLen === 0 || msgLen > 2048 || offset + msgLen > view.byteLength) return null;
+            var msgBytes = new Uint8Array(data, offset, msgLen);
             var msg = new TextDecoder().decode(msgBytes).replace(/\0/g, '').trim();
             if (!msg) return null;
             if (_isEcho(msg)) return null;
             var userName = _virtualIdMap[virtualId] || ('User#' + virtualId);
-            var label = header === 25 ? '⭐ ' : '';
             var time = _nowBrasilia();
+            if (header === 890) {
+                var targetName = _virtualIdMap[targetId] || ('User#' + targetId);
+                return '`' + time + '` \u2B05\uFE0F **' + userName + '** \u27A1\uFE0F **' + targetName + '**: ' + msg;
+            }
+            var label = header === 25 ? '⭐ ' : '';
             return '`' + time + '` \u2B05\uFE0F **' + label + userName + '**: ' + msg;
         } catch(e) { return null; }
     }
@@ -313,7 +335,6 @@
         _outboundCache = [];
         _virtualIdMap = {};
         _accountName = '';
-        _accountVirtualId = null;
         window.WebSocket = _origWebSocket;
         window._wsHooked = false;
         delete window._lens;
