@@ -13,7 +13,6 @@
     var _queue = [];
     var _isSending = false;
     var _virtualIdMap = {};
-    var _accountVirtualId = null;
     var _accountName = '';
     var _recentPackets = new Map();
     var _outboundCache = [];
@@ -168,17 +167,30 @@
             var view = new DataView(data);
             if (view.byteLength < 14) return null;
             var header = view.getUint16(4, false);
-            if (header !== 1146 && header !== 25) return null;
-            var virtualId = view.getUint16(8, false);
-            var msgLen = view.getUint16(10, false);
-            if (msgLen === 0 || msgLen > 2048 || 12 + msgLen > view.byteLength) return null;
-            var msgBytes = new Uint8Array(data, 12, msgLen);
+            if (header !== 1146 && header !== 25 && header !== 890) return null;
+            var offset = 6;
+            var targetId = null;
+            if (header === 890) {
+                targetId = view.getUint16(offset, false);
+                offset += 2;
+            }
+            var virtualId = view.getUint16(offset, false);
+            offset += 2;
+            var msgLen = view.getUint16(offset, false);
+            offset += 2;
+            if (msgLen === 0 || msgLen > 4096 || offset + msgLen > view.byteLength) return null;
+            var msgBytes = new Uint8Array(data, offset, msgLen);
             var msg = new TextDecoder().decode(msgBytes).replace(/\0/g, '').trim();
             if (!msg) return null;
             if (_isEcho(msg)) return null;
+            if (msg.length > 1800) msg = msg.substring(0, 1800) + '...';
             var userName = _virtualIdMap[virtualId] || ('User#' + virtualId);
-            var label = header === 25 ? '⭐ ' : '';
             var time = _nowBrasilia();
+            if (header === 890) {
+                var targetName = _virtualIdMap[targetId] || ('User#' + targetId);
+                return '`' + time + '` \u2B05\uFE0F **' + userName + '** \u27A1\uFE0F **' + targetName + '**: ' + msg;
+            }
+            var label = header === 25 ? '📢 ' : '';
             return '`' + time + '` \u2B05\uFE0F **' + label + userName + '**: ' + msg;
         } catch(e) { return null; }
     }
@@ -189,10 +201,11 @@
             if (view.byteLength < 10) return null;
             if (view.getUint16(4, false) !== 1678) return null;
             var msgLen = view.getUint16(6, false);
-            if (msgLen === 0 || msgLen > 2048 || 8 + msgLen > view.byteLength) return null;
+            if (msgLen === 0 || msgLen > 4096 || 8 + msgLen > view.byteLength) return null;
             var msgBytes = new Uint8Array(data, 8, msgLen);
             var msg = new TextDecoder().decode(msgBytes).replace(/\0/g, '').trim();
             if (!msg) return null;
+            if (msg.length > 1800) msg = msg.substring(0, 1800) + '...';
             _outboundCache.push({ text: msg, time: Date.now() });
             var time = _nowBrasilia();
             return '`' + time + '` \u27A1\uFE0F **Você**: ' + msg;
@@ -313,7 +326,6 @@
         _outboundCache = [];
         _virtualIdMap = {};
         _accountName = '';
-        _accountVirtualId = null;
         window.WebSocket = _origWebSocket;
         window._wsHooked = false;
         delete window._lens;
