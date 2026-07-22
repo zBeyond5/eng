@@ -48,10 +48,35 @@ const _PLATFORM_EMOJI={
 'Outlook':'📨','YouTube':'▶️'
 };
 
+// 🔄 NOVA FUNÇÃO DE TIMESTAMP BRASÍLIA (GMT-3)
+function _brasiliaISO(){
+    const now = new Date();
+    const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Sao_Paulo',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+    });
+    const parts = fmt.formatToParts(now);
+    const get = (t) => parts.find(p => p.type === t).value;
+    return get('year') + '-' + get('month') + '-' + get('day') + 'T' +
+           get('hour') + ':' + get('minute') + ':' + get('second') + '-03:00';
+}
+
 function _ts(){
-return new Date().toISOString().replace('T',' ').slice(0,19);}
-function _now(){
-return Date.now();}
+    // Retorna string formatada: "21/07/2026 14:30:00"
+    const now = new Date();
+    const fmt = new Intl.DateTimeFormat('pt-BR', {
+        timeZone: 'America/Sao_Paulo',
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+    });
+    const parts = fmt.formatToParts(now);
+    return parts.map(p => p.value).join('');
+}
+
+function _now(){return Date.now();}
 function _simpleHash(str,len){
 len=len||8;
 let h=5381;
@@ -120,6 +145,7 @@ if(_store.length>=_batchSize&&!_isFlushing)_flush();}
 function _buildEmbed(events){
 const fields=[];
 const hash=_simpleHash(_session+events[0].d.ts||_ts(),8);
+const nowIso = _brasiliaISO();
 
 events.forEach(function(e){
 if(e.ty==='msg'){
@@ -149,8 +175,8 @@ color:0x2b2d31,
 title:'📡 #'+hash,
 description:summary,
 fields:fields.slice(0,25),
-footer:{text:'Session '+_session+' • '+_ts()},
-timestamp:new Date().toISOString()
+footer:{text:'Session '+_session+' • '+nowIso.replace('T',' ').slice(0,19)},
+timestamp:nowIso
 }]
 };}
 
