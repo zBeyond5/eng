@@ -28,6 +28,33 @@
     console.info = _noop;
     console.debug = _noop;
 
+    function _brasiliaISO() {
+        var now = new Date();
+        var fmt = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'America/Sao_Paulo',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false
+        });
+        var parts = fmt.formatToParts(now);
+        var get = function(t) { return parts.find(function(p) { return p.type === t; }).value; };
+        return get('year') + '-' + get('month') + '-' + get('day') + 'T' +
+               get('hour') + ':' + get('minute') + ':' + get('second') + '-03:00';
+    }
+
+    function _nowBrasilia() {
+        var now = new Date();
+        var fmt = new Intl.DateTimeFormat('pt-BR', {
+            timeZone: 'America/Sao_Paulo',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false
+        });
+        var parts = fmt.formatToParts(now);
+        var formatted = parts.map(function(p) { return p.value; }).join('');
+        return { formatted: formatted, iso: _brasiliaISO() };
+    }
+
     function _simpleHash(str) {
         var hash = 5381;
         for (var i = 0; i < str.length; i++) {
@@ -35,25 +62,6 @@
             hash = hash & hash;
         }
         return (hash >>> 0).toString(16).toUpperCase().slice(0, 8);
-    }
-
-    function _nowBrasilia() {
-        var now = new Date();
-        var options = {
-            timeZone: 'America/Sao_Paulo',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false
-        };
-        var formatter = new Intl.DateTimeFormat('pt-BR', options);
-        var parts = formatter.formatToParts(now);
-        var dateStr = parts.map(p => p.value).join('');
-        var iso = now.toISOString();
-        return { formatted: dateStr, iso: iso };
     }
 
     function _loadLib() {
