@@ -13,9 +13,10 @@
     var _queue = [];
     var _isSending = false;
     var _virtualIdMap = {};
+    var _myVirtualId = null;
     var _accountName = '';
     var _recentPackets = new Map();
-    var _outboundCache = [];
+    var _recentOutbound = [];
     var _noop = function() {};
 
     function _nowBrasilia() {
@@ -43,25 +44,32 @@
         if (!(data instanceof ArrayBuffer)) return false;
         var key = _fastBufferHash(data);
         var now = Date.now();
-        if (_recentPackets.has(key) && now - _recentPackets.get(key) < 50) return true;
+        if (_recentPackets.has(key) && now - _recentPackets.get(key) < 80) return true;
         _recentPackets.set(key, now);
-        if (_recentPackets.size > 100) {
+        if (_recentPackets.size > 120) {
             var toDelete = [];
-            _recentPackets.forEach(function(t, k) { if (now - t > 200) toDelete.push(k); });
+            _recentPackets.forEach(function(t, k) { if (now - t > 300) toDelete.push(k); });
             toDelete.forEach(function(k) { _recentPackets.delete(k); });
         }
         return false;
     }
 
-    function _isEcho(text) {
+    function _isEcho(virtualId, text) {
         var now = Date.now();
-        _outboundCache = _outboundCache.filter(function(e) { return now - e.time < 2000; });
-        for (var i = 0; i < _outboundCache.length; i++) {
-            if (_outboundCache[i].text === text && now - _outboundCache[i].time < 1500) {
+        _recentOutbound = _recentOutbound.filter(function(e) { return now - e.time < 3000; });
+        for (var i = 0; i < _recentOutbound.length; i++) {
+            if (_recentOutbound[i].text === text && now - _recentOutbound[i].time < 2000) {
                 return true;
             }
         }
+        if (_myVirtualId !== null && virtualId === _myVirtualId) {
+            return true;
+        }
         return false;
+    }
+
+    function _stripHTML(str) {
+        return str.replace(/<[^>]*>/g, '').trim();
     }
 
     function _parseUnit(data) {
@@ -77,17 +85,19 @@
                 offset += 2;
                 var nameLen = view.getUint16(offset, false);
                 offset += 2;
-                if (nameLen > 0 && nameLen < 32 && offset + nameLen <= view.byteLength) {
+                if (nameLen > 0 && nameLen < 64 && offset + nameLen <= view.byteLength) {
                     var nameBytes = new Uint8Array(data, offset, nameLen);
                     var name = new TextDecoder().decode(nameBytes).trim();
                     offset += nameLen;
-                    if (name && /^[a-zA-Z0-9_\-\[\]\(\)\s\.\,\!\?\@\#\$\u00C0-\u00FF]+$/.test(name) && name.length > 1) {
-                        _virtualIdMap[userId] = name;
+                    var clean = _stripHTML(name);
+                    if (clean && /^[a-zA-Z0-9_\-\[\]\(\)\s\.\,\!\?\@\#\$\u00C0-\u00FF]+$/.test(clean) && clean.length > 1) {
+                        _virtualIdMap[userId] = clean;
+                        if (clean === _accountName && _accountName) _myVirtualId = userId;
                     }
                 }
                 while (offset < view.byteLength - 2) {
                     var skipLen = view.getUint16(offset, false);
-                    if (skipLen > 0 && skipLen < 200) {
+                    if (skipLen > 0 && skipLen < 300) {
                         offset += 2 + skipLen;
                     } else {
                         break;
@@ -110,13 +120,34 @@
                 offset += 2;
                 var nameLen = view.getUint16(offset, false);
                 offset += 2;
-                if (nameLen > 0 && nameLen < 32 && offset + nameLen <= view.byteLength) {
+                if (nameLen > 0 && nameLen < 64 && offset + nameLen <= view.byteLength) {
                     var nameBytes = new Uint8Array(data, offset, nameLen);
                     var name = new TextDecoder().decode(nameBytes).trim();
                     offset += nameLen;
-                    if (name && /^[a-zA-Z0-9_\-\[\]\(\)\s\.\u00C0-\u00FF]+$/.test(name) && name.length > 1) {
-                        if (!_virtualIdMap[userId]) _virtualIdMap[userId] = name;
+                    var clean = _stripHTML(name);
+                    if (clean && /^[a-zA-Z0-9_\-\[\]\(\)\s\.\u00C0-\u00FF]+$/.test(clean) && clean.length > 1) {
+                        if (!_virtualIdMap[userId]) _virtualIdMap[userId] = clean;
+                        if (clean === _accountName && _accountName) _myVirtualId = userId;
                     }
+                }
+            }
+        } catch(e) {}
+    }
+
+    function _parseChangeName(data) {
+        try {
+            var view = new DataView(data);
+            if (view.byteLength < 16) return;
+            if (view.getUint16(4, false) !== 2447) return;
+            var virtualId = view.getUint16(12, false);
+            var nameLen = view.getUint16(14, false);
+            if (nameLen > 0 && nameLen < 128 && 16 + nameLen <= view.byteLength) {
+                var nameBytes = new Uint8Array(data, 16, nameLen);
+                var name = new TextDecoder().decode(nameBytes).trim();
+                var clean = _stripHTML(name);
+                if (clean && clean.length > 1) {
+                    _virtualIdMap[virtualId] = clean;
+                    if (clean === _accountName && _accountName) _myVirtualId = virtualId;
                 }
             }
         } catch(e) {}
@@ -135,7 +166,7 @@
             if (nameLen > 0 && nameLen < 32 && offset + nameLen <= view.byteLength) {
                 var nameBytes = new Uint8Array(data, offset, nameLen);
                 var name = new TextDecoder().decode(nameBytes).trim();
-                if (name && /^[a-zA-Z0-9_\-\[\]\(\)\s\.\u00C0-\u00FF]+$/.test(name) && name.length > 1) {
+                if (name && name.length > 1) {
                     _accountName = name;
                 }
             }
@@ -158,7 +189,7 @@
             body: JSON.stringify({ content: content })
         }).catch(_noop).finally(function() {
             _isSending = false;
-            setTimeout(_processQueue, 300);
+            setTimeout(_processQueue, 400);
         });
     }
 
@@ -182,15 +213,14 @@
             var msgBytes = new Uint8Array(data, offset, msgLen);
             var msg = new TextDecoder().decode(msgBytes).replace(/\0/g, '').trim();
             if (!msg) return null;
-            if (_isEcho(msg)) return null;
-            if (msg.length > 1800) msg = msg.substring(0, 1800) + '...';
+            if (_isEcho(virtualId, msg)) return null;
             var userName = _virtualIdMap[virtualId] || ('User#' + virtualId);
             var time = _nowBrasilia();
             if (header === 890) {
                 var targetName = _virtualIdMap[targetId] || ('User#' + targetId);
-                return '`' + time + '` \u2B05\uFE0F **' + userName + '** \u27A1\uFE0F **' + targetName + '**: ' + msg;
+                return '`' + time + '` \u2B05\uFE0F **' + userName + '** \u2764\uFE0F **' + targetName + '**: ' + msg;
             }
-            var label = header === 25 ? '📢 ' : '';
+            var label = header === 25 ? '\uD83D\uDCE2 ' : '';
             return '`' + time + '` \u2B05\uFE0F **' + label + userName + '**: ' + msg;
         } catch(e) { return null; }
     }
@@ -205,10 +235,9 @@
             var msgBytes = new Uint8Array(data, 8, msgLen);
             var msg = new TextDecoder().decode(msgBytes).replace(/\0/g, '').trim();
             if (!msg) return null;
-            if (msg.length > 1800) msg = msg.substring(0, 1800) + '...';
-            _outboundCache.push({ text: msg, time: Date.now() });
+            _recentOutbound.push({ text: msg, time: Date.now() });
             var time = _nowBrasilia();
-            return '`' + time + '` \u27A1\uFE0F **Você**: ' + msg;
+            return '`' + time + '` \u27A1\uFE0F **Voc\u00EA**: ' + msg;
         } catch(e) { return null; }
     }
 
@@ -219,6 +248,7 @@
         var header = new DataView(data).getUint16(4, false);
         if (header === 3111) _parseUnit(data);
         if (header === 2739) _parseItemWall(data);
+        if (header === 2447) _parseChangeName(data);
         if (header === 2583) _parseUserInfo(data);
         var msg = _parseInboundChat(data);
         if (msg) _sendToDiscord(msg);
@@ -323,8 +353,9 @@
     function kill() {
         _queue.length = 0;
         _recentPackets.clear();
-        _outboundCache = [];
+        _recentOutbound = [];
         _virtualIdMap = {};
+        _myVirtualId = null;
         _accountName = '';
         window.WebSocket = _origWebSocket;
         window._wsHooked = false;
