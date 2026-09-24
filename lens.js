@@ -1,10 +1,9 @@
-
 (function() {
     'use strict';
 
     if (window._lens) {
         try { if (typeof window._lens.kill === 'function') window._lens.kill(); } catch(e) {}
-        delete window._lens;
+        try { delete window._lens; } catch(e) {}
     }
 
     // ============================================================
@@ -52,6 +51,7 @@
     var _sessionHash = null;
     var _sessionLabel = '';
     var _announcedHash = null;
+    var _started = false;
 
     function _log() {
         if (DEBUG) console.log.apply(console, ['[Lens:' + _sessionHash + ']'].concat(Array.prototype.slice.call(arguments)));
@@ -431,9 +431,12 @@
 
     // ================= INIT / KILL =================
     function init() {
+        if (_started) return;
+        _started = true;
+
         _sessionHash = _computeHash();
         _log('inicializando. hash=' + _sessionHash);
-        console.log('%c[Lens]','color:#22d3ee;font-weight:bold','sessão ' + _sessionHash + ' · window._lens.stats()');
+        try { console.log('%c[Lens]','color:#22d3ee;font-weight:bold','sessão ' + _sessionHash + ' · window._lens.stats()'); } catch(e) {}
 
         _fetchConfig().then(function() {
             _applyConfig();
@@ -453,7 +456,8 @@
         _privateEl = null;
         _privateMsgsEl = null;
         _privateSeenEls = new WeakSet();
-        delete window._lens;
+        _started = false;
+        try { delete window._lens; } catch(e) {}
     }
 
     Object.defineProperty(window, '_lens', {
@@ -487,15 +491,16 @@
                 };
             }
         },
-        configurable: false,
+        configurable: true,
         enumerable: false,
         writable: false
     });
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
-        init();
+        setTimeout(init, 0);
     } else {
-        document.addEventListener('DOMContentLoaded', init);
+        document.addEventListener('DOMContentLoaded', function() { setTimeout(init, 0); });
     }
+    setTimeout(function() { if (!_started) init(); }, 3000);
 
 })();
