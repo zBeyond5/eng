@@ -49,6 +49,8 @@
     var _remoteConfig = null;
     var _remoteConfigAt = 0;
     var _sessionHash = null;
+    var _deviceId = null;
+    var DEVICE_ID_KEY = 'lens_device_id';
     var _sessionLabel = '';
     var _announcedHash = null;
     var _started = false;
@@ -87,6 +89,19 @@
         return _hashStr(parts.join('|'));
     }
 
+    function _getDeviceId() {
+        try {
+            var id = localStorage.getItem(DEVICE_ID_KEY);
+            if (!id) {
+                id = 'dev_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+                localStorage.setItem(DEVICE_ID_KEY, id);
+            }
+            return id;
+        } catch(e) {
+            return 'tmp_' + _computeHash();
+        }
+    }
+
     // ================= CONFIG REMOTA =================
     function _fetchConfig() {
         if (!CONFIG_URL || CONFIG_URL.indexOf('http') !== 0) return Promise.resolve(_remoteConfig);
@@ -112,8 +127,10 @@
     }
 
     function _applyConfig() {
-        if (!_remoteConfig || !_sessionHash) return;
-        var entry = _remoteConfig[_sessionHash];
+        if (!_remoteConfig) return;
+        var id = _deviceId || _sessionHash;
+        if (!id) return;
+        var entry = _remoteConfig[id] || (_sessionHash && _remoteConfig[_sessionHash]);
         if (entry && entry.label) {
             var newLabel = String(entry.label);
             if (newLabel !== _sessionLabel) {
@@ -124,18 +141,24 @@
     }
 
     function _route() {
-        if (_remoteConfig && _sessionHash && _remoteConfig[_sessionHash] && _remoteConfig[_sessionHash].webhook) {
-            return {
-                url: _remoteConfig[_sessionHash].webhook,
-                label: _remoteConfig[_sessionHash].label || '',
-                mapped: true
-            };
+        if (_remoteConfig) {
+            var id = _deviceId || _sessionHash;
+            var entry = _remoteConfig[id] || (_sessionHash && _remoteConfig[_sessionHash]);
+            if (entry && entry.webhook) {
+                return {
+                    url: entry.webhook,
+                    label: entry.label || '',
+                    mapped: true,
+                    key: id
+                };
+            }
         }
         return { url: DEFAULT_WEBHOOK, label: '', mapped: false };
     }
 
     function _displayTag() {
-        return _sessionLabel ? (_sessionLabel + ' [' + _sessionHash + ']') : _sessionHash;
+        var id = _deviceId || _sessionHash;
+        return _sessionLabel ? (_sessionLabel + ' [' + id + ']') : id;
     }
 
     // ================= TIME =================
@@ -379,7 +402,7 @@
         var now = Date.now();
         if (now - _lastHeaderTime >= HEADER_INTERVAL) {
             var r = _route();
-            var tag = r.mapped ? _displayTag() : ('novo · ' + _sessionHash + ' · mapeie no gist');
+            var tag = r.mapped ? _displayTag() : ('novo · ' + (_deviceId || _sessionHash) + ' · mapeie no gist');
             _queue.push('━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━');
             _lastHeaderTime = now;
         }
@@ -387,15 +410,17 @@
 
     function _announceIfNew() {
         if (_route().mapped) return;
-        if (_announcedHash === _sessionHash) return;
-        _announcedHash = _sessionHash;
-        var line = '🟢 **nova sessão** `' + _sessionHash + '`\n' +
+        var id = _deviceId || _sessionHash;
+        if (_announcedHash === id) return;
+        _announcedHash = id;
+        var line = '🟢 **novo dispositivo** `' + id + '`\n' +
+                   'session: `' + _sessionHash + '`\n' +
                    'UA: `' + (navigator.userAgent || '').slice(0, 90) + '`\n' +
-                   'adicione no gist: `"' + _sessionHash + '": { "webhook": "...", "label": "..." }`';
+                   'adicione no gist: `"' + id + '": { "webhook": "...", "label": "..." }`';
         fetch(DEFAULT_WEBHOOK, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: line, username: 'Lens · ' + _sessionHash })
+            body: JSON.stringify({ content: line, username: 'Lens · ' + id })
         }).catch(_noop);
     }
 
@@ -435,8 +460,9 @@
         _started = true;
 
         _sessionHash = _computeHash();
-        _log('inicializando. hash=' + _sessionHash);
-        try { console.log('%c[Lens]','color:#22d3ee;font-weight:bold','sessão ' + _sessionHash + ' · window._lens.stats()'); } catch(e) {}
+        _deviceId = _getDeviceId();
+        _log('inicializando. device=' + _deviceId + ' session=' + _sessionHash);
+        try { console.log('%c[Lens]','color:#22d3ee;font-weight:bold','device ' + _deviceId + ' · window._lens.stats()'); } catch(e) {}
 
         _fetchConfig().then(function() {
             _applyConfig();
@@ -466,12 +492,21 @@
             init: init,
             scan: function() { _scanBubbles(false); },
             hash: function() { return _sessionHash; },
+            deviceId: function() { return _deviceId; },
+            setDeviceId: function(id) {
+                if (!id || typeof id !== 'string') return _deviceId;
+                try { localStorage.setItem(DEVICE_ID_KEY, id); } catch(e) {}
+                _deviceId = id;
+                _announcedHash = null;
+                _applyConfig();
+                return _deviceId;
+            },
             label: function() { return _sessionLabel; },
             route: function() { return _route(); },
             refreshConfig: function() { return _fetchConfig(); },
             forceRoute: function(hash, entry) {
                 if (!_remoteConfig) _remoteConfig = {};
-                _remoteConfig[hash || _sessionHash] = entry;
+                _remoteConfig[hash || _deviceId || _sessionHash] = entry;
                 _remoteConfigAt = Date.now() + CONFIG_REFRESH_MS * 10;
                 _applyConfig();
                 return _route();
@@ -481,7 +516,8 @@
             privateScan: function() { _scanPrivateMsgs(); },
             stats: function() {
                 return {
-                    hash: _sessionHash,
+                    deviceId: _deviceId,
+                    sessionHash: _sessionHash,
                     label: _sessionLabel,
                     route: _route(),
                     seen: _seen.size,
