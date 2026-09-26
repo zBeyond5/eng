@@ -9,7 +9,7 @@
     // ============================================================
     // CONFIG
     // ============================================================
-    var LENS_VERSION = '2.2.0';
+    var LENS_VERSION = '2.2.2';
 
     var DEFAULT_WEBHOOK = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
     var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/lens.json';
