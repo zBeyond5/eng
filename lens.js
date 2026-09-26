@@ -9,7 +9,7 @@
     // ============================================================
     // CONFIG
     // ============================================================
-    var LENS_VERSION = '2.2.2';
+    var LENS_VERSION = '2.2.3';
 
     var DEFAULT_WEBHOOK = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
     var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/lens.json';
@@ -22,11 +22,8 @@
     var PRIVATE_PEER_SEL = '.messenger-active-chat-header .fw-bold.text-truncate';
     var PRIVATE_MSGS_SEL = '.chat-messages';
     var PRIVATE_MSG_SEL = '.messages-group-left, .messages-group-right';
-    var PRIVATE_PING = '<@&1552637564597436537>';
     var PRIVATE_FIRST_SCAN_DELAY = 300;
 
-    // Anti-duplicação por peer. Persistido em localStorage para sobreviver
-    // a reloads e evitar re-emissão de histórico a cada abertura.
     var DM_LOG_KEY = 'lens_dm_log_v1';
     var DM_LOG_MAX_PER_PEER = 500;
     var DM_LOG_SAVE_DEBOUNCE_MS = 1500;
@@ -38,7 +35,6 @@
     var FLUSH_DELAY = 400;
     var MAX_QUEUE = 5000;
 
-    // Cache do roteamento (fallback de boot / gist offline). Revalida a cada 6h.
     var ROUTE_CACHE_KEY = 'lens_route_cache_v1';
     var ROUTE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
     // ============================================================
@@ -59,7 +55,7 @@
 
     var _queue = [];
     var _isSending = false;
-    var _lastHeaderTime = 0;
+    var _lastHeaderTime = { public: 0, dms: 0 };
     var _seen = new Set();
     var _observer = null;
     var _scanScheduled = false;
@@ -75,9 +71,10 @@
     var _announcedHash = null;
     var _started = false;
 
-    var _lastSpeakerKey = null;
+    // Chave de agrupamento por canal. Cada kind tem sua própria chave
+    // pra que trocar de canal não reinicie o agrupamento do outro.
+    var _lastSpeakerKey = { public: null, dms: null };
 
-    // Estado por peer: WeakSet (nós DOM) + Set de hashes (persistido).
     var _privateStateByPeer = new Map();
     var _privateCurrentPeer = null;
     var _privateSeenEls = null;
@@ -245,7 +242,6 @@
                 });
                 localStorage.setItem(DM_LOG_KEY, JSON.stringify(out));
             } catch(e) {
-                // Quota estourou — limpa e deixa regravar do zero
                 try { localStorage.removeItem(DM_LOG_KEY); } catch(e2) {}
             }
         }, DM_LOG_SAVE_DEBOUNCE_MS);
@@ -363,7 +359,11 @@
     }
 
     // ================= AGRUPAMENTO DE VOZ =================
-    function _resetSpeaker() { _lastSpeakerKey = null; }
+    function _resetSpeaker(kind) {
+        if (kind === 'public') _lastSpeakerKey.public = null;
+        else if (kind === 'dms') _lastSpeakerKey.dms = null;
+        else { _lastSpeakerKey.public = null; _lastSpeakerKey.dms = null; }
+    }
 
     // ================= TIME =================
     function _nowBrasilia() {
@@ -449,8 +449,37 @@
     function _checkPrivate() {
         var el = null;
         try { el = document.querySelector(PRIVATE_WINDOW_SEL); } catch(e) {}
-        if (el && !_privateOpen) _openPrivate(el);
-        else if (!el && _privateOpen) _closePrivate();
+        if (el && !_privateOpen) {
+            _openPrivate(el);
+        } else if (!el && _privateOpen) {
+            _closePrivate();
+        } else if (el && _privateOpen) {
+            _checkPeerSwap(el);
+        }
+    }
+
+    // Detecta troca de contato sem fechar/abrir a janela.
+    // Compara o peer do header com o peer atual. Se mudou, re-observa o
+    // container de mensagens (que o Discord substitui na troca) e notifica.
+    function _checkPeerSwap(el) {
+        var peer = _privatePeer(el);
+        if (peer === _privateCurrentPeer) return;
+
+        var oldPeer = _privateCurrentPeer || '(sem nome)';
+        _privateCurrentPeer = peer;
+
+        var rec = _stateFor(peer);
+        _privateSeenEls = rec.seen;
+
+        // Container de mensagens foi trocado pelo Discord. Sem re-observar
+        // o novo nó, paramos de ver mensagens do contato novo.
+        if (_privateMsgsObserver) { _privateMsgsObserver.disconnect(); _privateMsgsObserver = null; }
+        _privateMsgsEl = null;
+
+        _resetSpeaker('dms');
+        _enqueueStatus('dms', '▸ 🔄 ***Trocou*** · `' + oldPeer + '` → `' + (peer || '(sem nome)') + '`');
+
+        _watchPrivateMsgs(el);
     }
 
     function _privatePeer(el) {
@@ -470,20 +499,16 @@
         var rec = _stateFor(peer);
         _privateSeenEls = rec.seen;
 
-        var tag = _routeCache && _routeCache.mapped ? _displayTag() : _sessionHash;
-
-        _resetSpeaker();
-        _enqueue('public', '━━━━━━━━ 🔒 ' + PRIVATE_PING + ' ━━━━━━━━');
-        _enqueue('public', '`' + _nowBrasilia() + '` 🔓 **janela privada ABERTA**' + (peer ? ' · **' + peer + '**' : '') + ' · ' + tag);
+        _resetSpeaker('dms');
+        _enqueueStatus('dms', '▸ 🟢 ***Aberto*** · `' + (peer || '(sem nome)') + '`');
 
         _watchPrivateMsgs(el);
     }
 
     function _closePrivate() {
         var peer = _privatePeer(_privateEl);
-        _resetSpeaker();
-        _enqueue('public', '`' + _nowBrasilia() + '` 🔒 **janela privada FECHADA**' + (peer ? ' · **' + peer + '**' : ''));
-        _enqueue('public', '━━━━━━━━ 🔒 fim privado ━━━━━━━━');
+        _resetSpeaker('dms');
+        _enqueueStatus('dms', '⏹ 🔴 __Fechado__ · `' + (peer || '(sem nome)') + '`');
 
         _privateOpen = false;
         _privateEl = null;
@@ -498,7 +523,6 @@
         var msgs = null;
         try { msgs = el.querySelector(PRIVATE_MSGS_SEL); } catch(e) {}
         if (!msgs) {
-            // Container pode não estar pronto em troca rápida de peer
             if (attempt < 5) setTimeout(function() { _watchPrivateMsgs(el, attempt + 1); }, 200 * (attempt + 1));
             return;
         }
@@ -553,14 +577,14 @@
     function _emitPrivateText(user, text, isSelf) {
         var arrow = isSelf ? '➡️' : '⬅️';
         var key = 'priv:' + arrow + ':' + user;
-        var cont = (key === _lastSpeakerKey);
+        var cont = (key === _lastSpeakerKey.dms);
 
         var body;
         if (cont) {
             body = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' ' + text;
         } else {
             body = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' **' + user + '**: ' + text;
-            _lastSpeakerKey = key;
+            _lastSpeakerKey.dms = key;
         }
         _enqueue('dms', body);
     }
@@ -643,31 +667,43 @@
         var isAlert = _hasAlert(msg);
         var prefix = isAlert ? (ALERT_PING + ' ') : '';
 
-        if (isAlert) _resetSpeaker();
+        if (isAlert) _resetSpeaker('public');
 
         var key = 'pub:' + user;
-        var cont = (key === _lastSpeakerKey);
+        var cont = (key === _lastSpeakerKey.public);
 
         var body;
         if (cont) {
             body = '`' + _nowBrasilia() + '` ⬅️ ' + msg;
         } else {
             body = '`' + _nowBrasilia() + '` ⬅️ ' + _format(user, msg);
-            _lastSpeakerKey = key;
+            _lastSpeakerKey.public = key;
         }
         _enqueue('public', prefix + body);
     }
 
+    // Header por canal. Cada kind tem seu próprio intervalo de 60s.
+    // Visual diferenciado:
+    //   public: ━━━ 🕐 **HH:MM** · `label` ━━━
+    //   dms:    ━━━ 🔒 **HH:MM** ━━━
     function _checkHeader(kind) {
         var now = Date.now();
-        if (now - _lastHeaderTime >= HEADER_INTERVAL) {
+        if (now - _lastHeaderTime[kind] < HEADER_INTERVAL) return;
+
+        var line;
+        if (kind === 'dms') {
+            line = '━━━━━━━ 🔒 **' + _nowHHMM() + '** ━━━━━━━';
+        } else {
             var tag = _routeCache && _routeCache.mapped
-                ? _displayTag()
-                : ('novo · ' + (_deviceId || _sessionHash) + ' · mapeie no gist');
-            _queue.push({ kind: kind, line: '━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━' });
-            _lastHeaderTime = now;
-            _resetSpeaker();
+                ? '`' + _displayTag() + '`'
+                : ('novo · `' + (_deviceId || _sessionHash) + '` · mapeie no gist');
+            line = '━━━━━━━ 🕐 **' + _nowHHMM() + '** · ' + tag + ' ━━━━━━━';
         }
+        _queue.push({ kind: kind, line: line });
+        _lastHeaderTime[kind] = now;
+
+        // Header quebra agrupamento do seu canal
+        _resetSpeaker(kind);
     }
 
     function _announceIfNew() {
@@ -689,6 +725,21 @@
     function _enqueue(kind, line) {
         if (!line || line.length < 5) return;
         _checkHeader(kind);
+
+        if (_queue.length >= MAX_QUEUE) {
+            var drop = _queue.length - MAX_QUEUE + 1;
+            _queue.splice(0, drop);
+            _metrics.queueDropped += drop;
+            _debugReport('queue-overflow', 'descartados ' + drop + ' itens', String(_queue.length));
+        }
+
+        _queue.push({ kind: kind, line: line });
+        if (!_isSending) _flush();
+    }
+
+    // Status de sessão (abriu/fechou/trocou). Nunca dispara header.
+    function _enqueueStatus(kind, line) {
+        if (!line || line.length < 5) return;
 
         if (_queue.length >= MAX_QUEUE) {
             var drop = _queue.length - MAX_QUEUE + 1;
@@ -818,7 +869,7 @@
         _privateStateByPeer.clear();
         _privateCurrentPeer = null;
         _privateSeenEls = null;
-        _lastSpeakerKey = null;
+        _lastSpeakerKey = { public: null, dms: null };
         if (_dmLogSaveTimer) { clearTimeout(_dmLogSaveTimer); _dmLogSaveTimer = null; }
         _started = false;
         try { delete window._lens; } catch(e) {}
