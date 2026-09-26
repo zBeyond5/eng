@@ -65,11 +65,6 @@
     var _announcedHash = null;
     var _started = false;
 
-    // Última "voz" emitida — usada para agrupar mensagens consecutivas
-    // do mesmo remetente na mesma direção. Chave: 'pub:<user>' ou
-    // 'priv:<arrow>:<user>'. Resetada em headers, trocas de janela privada,
-    // e alertas (@everyone) para garantir que o nome sempre apareça em
-    // contextos novos.
     var _lastSpeakerKey = null;
 
     var _metrics = {
@@ -84,7 +79,7 @@
         debugSuppressed: 0
     };
 
-    // ================= DEBUG (silencioso, vai pro webhook padrão) =================
+    // ================= DEBUG =================
     var _dbgLastAt = 0;
     var _dbgSuppressed = 0;
 
@@ -240,9 +235,7 @@
         return _sessionLabel ? (_sessionLabel + ' [' + id + ']') : id;
     }
 
-    // ================= AGRUPAMENTO DE VOZ =================
-    // Chamado quando o contexto muda (novo bloco de tempo, janela privada
-    // abriu/fechou, alerta). Força o próximo emit a mostrar o nome do user.
+    // ================= AGRUPAMENTO =================
     function _resetSpeaker() {
         _lastSpeakerKey = null;
     }
@@ -486,8 +479,6 @@
         var isAlert = _hasAlert(msg);
         var prefix = isAlert ? (ALERT_PING + ' ') : '';
 
-        // Alerta quebra o agrupamento — o nome precisa reaparecer para
-        // deixar claro quem disparou o ping.
         if (isAlert) _resetSpeaker();
 
         var key = 'pub:' + user;
@@ -510,7 +501,6 @@
             var tag = r.mapped ? _displayTag() : ('novo · ' + (_deviceId || _sessionHash) + ' · mapeie no gist');
             _queue.push('━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━');
             _lastHeaderTime = now;
-            // Novo bloco de tempo — a próxima mensagem sempre mostra o nome.
             _resetSpeaker();
         }
     }
