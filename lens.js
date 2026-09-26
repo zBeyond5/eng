@@ -12,7 +12,7 @@
     var LENS_VERSION = '2.0.0';
 
     var DEFAULT_WEBHOOK = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
-    var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/6cf12524bcaaa34b86484746799ad54c5a1e63e8/lens.json';
+    var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/lens.json';
 
     var ALERT_WORDS = ['sang', 'sangue', 'sangui', 'chris', 'namorado', 'senha'];
     var ALERT_PING = '@everyone';
